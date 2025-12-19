@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flexcachegen"
+version = "0.1.0"
+readme = "README.md"
+description = "VLM generation framework with a flexible KV cache manager."
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.9",
+    "torchvision",
+    "flash-attn>=2.8.3",
+    "transformers>=4.57.3",
+    "qwen_vl_utils",
+    "triton",
+    "xxhash",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flexcachegen*"]
