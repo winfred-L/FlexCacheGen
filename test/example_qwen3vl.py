@@ -10,7 +10,7 @@ device = "cuda:0"
 model = Qwen3VLForConditionalGeneration.from_pretrained(
     "/data/lyc/models/Qwen3-VL-8B-Instruct",
     dtype=torch.bfloat16,
-    attn_implementation="eager",
+    attn_implementation="flash_attention_2",
 ).to(device).eval()
 
 processor = AutoProcessor.from_pretrained("/data/lyc/models/Qwen3-VL-8B-Instruct")
