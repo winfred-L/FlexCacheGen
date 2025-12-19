@@ -16,7 +16,7 @@ MAX_JOBS=4 pip install flash-attn --no-build-isolation
 
 # install torchcodec
 conda install "ffmpeg"
-pip install torchcodec
+pip install torchcodec --index-url https://download.pytorch.org/whl/cu130
 
 # install other packages
 pip install -e .
