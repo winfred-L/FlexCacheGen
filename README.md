@@ -1,6 +1,27 @@
 # FlexCacheGen
 
-VLM generation framework with a flexible KV cache manager.
+A VLM generation framework with a flexible KV cache manager.
+
+## Introduction
+
+Combine [FlexGen](https://github.com/FMInference/FlexLLMGen) and [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm), support latest VLM [Qwen3-VL](https://huggingface.co/collections/Qwen/qwen3-vl).
+
+Features:
+- Sparse attention implememt with sparse KV cache management.
+- KV cache offloading to memory after prefill stage, only load important part in decoding stage.
+- Overlapping attention computation with KV cache IO.
+- Paged KV cache management with head granularity, instead of token granularity.
+
+
+## Architechture
+
+```
+Engine 负责计算流程控制
+ModelRunner 负责提供对应计算组件的接口
+KVCacheManager 负责 KV Cache 管理
+
+```
+
 
 ## Installation
 

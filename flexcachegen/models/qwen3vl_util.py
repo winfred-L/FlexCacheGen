@@ -1,0 +1,177 @@
+import torch
+from typing import Optional
+from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+
+
+# modified from Qwen3VLModel
+def get_video_features(
+    visual_encoder: Qwen3VLVisionModel,
+    pixel_values_videos: torch.FloatTensor,
+    video_grid_thw: Optional[torch.LongTensor] = None
+):
+    pixel_values_videos = pixel_values_videos.to(visual_encoder.dtype)
+    video_embeds, deepstack_video_embeds = visual_encoder(pixel_values_videos, grid_thw=video_grid_thw)
+    split_sizes = (video_grid_thw.prod(-1) // visual_encoder.spatial_merge_size**2).tolist()
+    image_embeds = torch.split(video_embeds, split_sizes)
+    return image_embeds, deepstack_video_embeds
+
+# modified from Qwen3VLModel
+def get_placeholder_mask(
+    text_embed_layer: torch.nn.Embedding,
+    config: Qwen3VLConfig,
+    input_ids: torch.LongTensor,
+    inputs_embeds: torch.FloatTensor,
+    image_features: Optional[torch.FloatTensor] = None,
+    video_features: Optional[torch.FloatTensor] = None,
+):
+    if input_ids is None:
+        special_image_mask = inputs_embeds == text_embed_layer(
+            torch.tensor(config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+        )
+        special_image_mask = special_image_mask.all(-1)
+        special_video_mask = inputs_embeds == text_embed_layer(
+            torch.tensor(config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
+        )
+        special_video_mask = special_video_mask.all(-1)
+    else:
+        special_image_mask = input_ids == config.image_token_id
+        special_video_mask = input_ids == config.video_token_id
+
+    n_image_tokens = special_image_mask.sum()
+    special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+    if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
+        raise ValueError(
+            f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
+        )
+
+    n_video_tokens = special_video_mask.sum()
+    special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+    if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
+        raise ValueError(
+            f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
+        )
+
+    return special_image_mask, special_video_mask
+
+# modified from Qwen3VLModel
+def get_rope_index(
+    config: Qwen3VLConfig,
+    input_ids: Optional[torch.LongTensor] = None,
+    image_grid_thw: Optional[torch.LongTensor] = None,
+    video_grid_thw: Optional[torch.LongTensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Different from the original implementation, Qwen3VL use timestamps rather than absolute time position ids."""
+
+    # Since we use timestamps to seperate videos, like <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split
+    if video_grid_thw is not None:
+        video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+        video_grid_thw[:, 0] = 1
+
+    spatial_merge_size = config.vision_config.spatial_merge_size
+    image_token_id = config.image_token_id
+    video_token_id = config.video_token_id
+    vision_start_token_id = config.vision_start_token_id
+    mrope_position_deltas = []
+    if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+        total_input_ids = input_ids
+        if attention_mask is None:
+            attention_mask = torch.ones_like(total_input_ids)
+        position_ids = torch.ones(
+            3,
+            input_ids.shape[0],
+            input_ids.shape[1],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        image_index, video_index = 0, 0
+        attention_mask = attention_mask.to(total_input_ids.device)
+        for i, input_ids in enumerate(total_input_ids):
+            input_ids = input_ids[attention_mask[i] == 1]
+            image_nums, video_nums = 0, 0
+            vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+            vision_tokens = input_ids[vision_start_indices + 1]
+            image_nums = (vision_tokens == image_token_id).sum()
+            video_nums = (vision_tokens == video_token_id).sum()
+            input_tokens = input_ids.tolist()
+            llm_pos_ids_list: list = []
+            st = 0
+            remain_images, remain_videos = image_nums, video_nums
+            for _ in range(image_nums + video_nums):
+                if image_token_id in input_tokens and remain_images > 0:
+                    ed_image = input_tokens.index(image_token_id, st)
+                else:
+                    ed_image = len(input_tokens) + 1
+                if video_token_id in input_tokens and remain_videos > 0:
+                    ed_video = input_tokens.index(video_token_id, st)
+                else:
+                    ed_video = len(input_tokens) + 1
+                if ed_image < ed_video:
+                    t, h, w = (
+                        image_grid_thw[image_index][0],
+                        image_grid_thw[image_index][1],
+                        image_grid_thw[image_index][2],
+                    )
+                    image_index += 1
+                    remain_images -= 1
+                    ed = ed_image
+
+                else:
+                    t, h, w = (
+                        video_grid_thw[video_index][0],
+                        video_grid_thw[video_index][1],
+                        video_grid_thw[video_index][2],
+                    )
+                    video_index += 1
+                    remain_videos -= 1
+                    ed = ed_video
+                llm_grid_t, llm_grid_h, llm_grid_w = (
+                    t.item(),
+                    h.item() // spatial_merge_size,
+                    w.item() // spatial_merge_size,
+                )
+                text_len = ed - st
+
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+                # t_index is always 0 because llm_grid_t is always 1 (we use timestamps to encode the temporal information for videos)
+                t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
+                h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
+            mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+        mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+        return position_ids, mrope_position_deltas
+    else:
+        if attention_mask is not None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
+            max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
+            mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+        else:
+            position_ids = (
+                torch.arange(input_ids.shape[1], device=input_ids.device)
+                .view(1, 1, -1)
+                .expand(3, input_ids.shape[0], -1)
+            )
+            mrope_position_deltas = torch.zeros(
+                [input_ids.shape[0], 1],
+                device=input_ids.device,
+                dtype=input_ids.dtype,
+            )
+
+        return position_ids, mrope_position_deltas
+
