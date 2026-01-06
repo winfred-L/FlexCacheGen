@@ -99,9 +99,9 @@ class Qwen3VLTextAttention(nn.Module):
 
         if is_prefill:
             # store kv to kv cache pool
-            kv_cache_manager.gpu_k_buffer[:, :seq_len].copy_(k)
-            kv_cache_manager.gpu_v_buffer[:, :seq_len].copy_(v)
-            kv_cache_manager.cache_seqlens.fill_(seq_len)
+            kv_cache_manager.gpu_k_buffer[self.layer_idx][:, :seq_len].copy_(k)
+            kv_cache_manager.gpu_v_buffer[self.layer_idx][:, :seq_len].copy_(v)
+            kv_cache_manager.cache_seqlens[self.layer_idx].fill_(seq_len)
             kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
 
             # attention computation
@@ -116,10 +116,11 @@ class Qwen3VLTextAttention(nn.Module):
             # flash_attn_with_kvcache() will update kv cache inside
             attn_output = flash_attn_with_kvcache(
                 q=q,
-                k_cache=kv_cache_manager.gpu_k_buffer, v_cache=kv_cache_manager.gpu_v_buffer,
+                k_cache=kv_cache_manager.gpu_k_buffer[self.layer_idx],
+                v_cache=kv_cache_manager.gpu_v_buffer[self.layer_idx],
                 k=k,
                 v=v,
-                cache_seqlens=kv_cache_manager.cache_seqlens,
+                cache_seqlens=kv_cache_manager.cache_seqlens[self.layer_idx],
                 causal=True
             )
 

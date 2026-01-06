@@ -5,16 +5,26 @@ from flexcachegen.config import Config
 class KVCacheManager:
     def __init__(self, config: Config):
         self.config = config
+        self.num_hidden_layers = config.hf_config.text_config.num_hidden_layers
 
         batch = 1
         seq = 20000 # TODO
         num_kv_heads = config.hf_config.text_config.num_key_value_heads
         head_dim = config.hf_config.text_config.hidden_size // config.hf_config.text_config.num_attention_heads
 
-        self.gpu_k_buffer = torch.empty(batch, seq, num_kv_heads, head_dim, device=config.device, dtype=torch.bfloat16)
-        self.gpu_v_buffer = torch.empty(batch, seq, num_kv_heads, head_dim, device=config.device, dtype=torch.bfloat16)
+        self.gpu_k_buffer = [
+            torch.empty(batch, seq, num_kv_heads, head_dim, device=config.device, dtype=torch.bfloat16)
+            for _ in range(self.num_hidden_layers)
+        ]
+        self.gpu_v_buffer = [
+            torch.empty(batch, seq, num_kv_heads, head_dim, device=config.device, dtype=torch.bfloat16)
+            for _ in range(self.num_hidden_layers)
+        ]
 
-        self.cache_seqlens = torch.zeros((batch,), device=config.device, dtype=torch.int32)
+        self.cache_seqlens = [
+            torch.zeros((batch,), device=config.device, dtype=torch.int32)
+            for _ in range(self.num_hidden_layers)
+        ]
     
     def offload_layer_to_cpu(self, layer_idx): pass
     def load_layer_to_gpu(self, layer_idx): pass
