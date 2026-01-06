@@ -3,6 +3,9 @@ from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 
+import sys
+from torchinfo import summary
+
 from transformers import AutoProcessor
 
 from flexcachegen.kvcache import KVCacheManager
@@ -63,7 +66,24 @@ class VLMEngine:
     
     def is_finished(self, output_ids: list[int]) -> bool:
         return output_ids[-1] in self.config.eos_token_id or len(output_ids) >= self.config.max_new_tokens
-        
+    
+
+    def print_memory_usage(self):
+        cur_mem = torch.cuda.memory_allocated(self.config.device)
+        peak_mem = torch.cuda.max_memory_allocated(self.config.device)
+        print(f"Current memory allocated: {cur_mem / 1024 ** 3:.2f} GB")
+        print(f"Peak memory allocated: {peak_mem / 1024 ** 3:.2f} GB")
+
+    def print_inputs_size(self, inputs_dict):
+        total_bytes = 0
+        for k, v in inputs_dict.items():
+            if torch.is_tensor(v):
+                v_bytes = v.nelement() * v.element_size()
+                total_bytes += v_bytes
+                print(f"Input key: {k}, type: {type(v)}, shape: {v.shape}, dtype: {v.dtype}, size: {v_bytes / (1024 ** 2):.2f} MB")
+
+        total_mb = total_bytes / (1024 ** 2)
+        print(f"Total inputs size: {total_mb:.2f} MB")
 
     def generate_single(self, video_path: str, question: str):
         output_ids = []
@@ -71,6 +91,11 @@ class VLMEngine:
         # process input
         inputs = self.process_input(video_path, question)
         inputs = inputs.to(self.config.device)
+        self.print_inputs_size(inputs)
+
+        self.print_memory_usage()
+        # summary(self.model)
+        import pdb; pdb.set_trace()
         
         # encoding step
         hidden_states = self.model.encoding(
@@ -80,6 +105,9 @@ class VLMEngine:
             video_grid_thw=inputs["video_grid_thw"]
         )
 
+        self.print_memory_usage()
+        import pdb; pdb.set_trace()
+
         # prefill stage
         for layer_idx in range(self.num_hidden_layers):
             hidden_states = self.model.attention(True, hidden_states, layer_idx)
@@ -88,6 +116,8 @@ class VLMEngine:
 
         token_id, logits = self.model.output_head(hidden_states)
         output_ids.append(token_id)
+
+        self.print_memory_usage()
 
         # decoding stage
         while not self.is_finished(output_ids):
@@ -102,9 +132,16 @@ class VLMEngine:
             output_ids.append(token_id)
 
             print(f"step {len(output_ids)}: token_id={token_id}")
+            self.print_memory_usage()
 
         # clean up kv cache
         self.kv_cache_manager.clear()
+
+        # print memory usage
+        cur_mem = torch.cuda.memory_allocated(self.config.device)
+        peak_mem = torch.cuda.max_memory_allocated(self.config.device)
+        print(f"Current memory allocated: {cur_mem / 1024 ** 3:.2f} GB")
+        print(f"Peak memory allocated: {peak_mem / 1024 ** 3:.2f} GB")
 
         # return output text
         output_text = self.processor.batch_decode(

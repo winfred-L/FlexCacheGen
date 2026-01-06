@@ -105,6 +105,9 @@ class Qwen3VLModel(nn.Module):
         # print(f"Text Unexpected Keys: {text_info.unexpected_keys}")
         
         del state_dict, visual_state_dict, text_state_dict
+        torch.cuda.empty_cache()
+
+        print("Qwen3VLModel init done.")
 
 
     def encoding(
@@ -196,7 +199,7 @@ class Qwen3VLModel(nn.Module):
         # add visual features to the hidden states of first several decoder layers (only prefill)
         if layer_idx < len(self.deepstack_video_embeds):
             visual_pos_masks = self.visual_pos_masks#.to(device=self.config.device)
-            deepstack_video_embeds = self.deepstack_video_embeds#.to(device=self.config.device, dtype=hidden_states.dtype)
+            deepstack_video_embeds = self.deepstack_video_embeds[layer_idx]#.to(device=self.config.device, dtype=hidden_states.dtype)
             local_this = hidden_states[visual_pos_masks, :].clone() + deepstack_video_embeds
             hidden_states[visual_pos_masks, :] = local_this
         return hidden_states
