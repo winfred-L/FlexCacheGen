@@ -8,9 +8,10 @@ from torchinfo import summary
 
 from transformers import AutoProcessor
 
-from flexcachegen.kvcache import KVCacheManager
 from flexcachegen.config import Config
+from flexcachegen.kvcache import KVCacheManager
 from flexcachegen.models.qwen3vl import Qwen3VLModel
+from flexcachegen.utils import get_tensor_size, print_cuda_memory_usage, print_duration
 
 
 class VLMEngine:
@@ -68,12 +69,6 @@ class VLMEngine:
         return output_ids[-1] in self.config.eos_token_id or len(output_ids) >= self.config.max_new_tokens
     
 
-    def print_memory_usage(self):
-        cur_mem = torch.cuda.memory_allocated(self.config.device)
-        peak_mem = torch.cuda.max_memory_allocated(self.config.device)
-        print(f"Current memory allocated: {cur_mem / 1024 ** 3:.2f} GB")
-        print(f"Peak memory allocated: {peak_mem / 1024 ** 3:.2f} GB")
-
     def print_inputs_size(self, inputs_dict):
         total_bytes = 0
         for k, v in inputs_dict.items():
@@ -85,30 +80,38 @@ class VLMEngine:
         total_mb = total_bytes / (1024 ** 2)
         print(f"Total inputs size: {total_mb:.2f} MB")
 
+    @torch.inference_mode()
     def generate_single(self, video_path: str, question: str):
         output_ids = []
 
         # process input
+        print('='* 20 + ' Process Input ' + '='*20)
+        t = perf_counter()
         inputs = self.process_input(video_path, question)
         inputs = inputs.to(self.config.device)
+        prompt_len = inputs["input_ids"].shape[1]
+        print_duration(t, perf_counter())
         self.print_inputs_size(inputs)
-
-        self.print_memory_usage()
-        # summary(self.model)
-        import pdb; pdb.set_trace()
+        print_cuda_memory_usage(self.config.device)
         
         # encoding step
-        hidden_states = self.model.encoding(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            pixel_values_videos=inputs["pixel_values_videos"],
-            video_grid_thw=inputs["video_grid_thw"]
-        )
-
-        self.print_memory_usage()
-        import pdb; pdb.set_trace()
+        print('='* 20 + ' Encoding ' + '='*20)
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        t = perf_counter()
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
+            hidden_states = self.model.encoding(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                pixel_values_videos=inputs["pixel_values_videos"],
+                video_grid_thw=inputs["video_grid_thw"]
+            )
+        print_duration(t, perf_counter())
+        print(f'hidden_states size: {get_tensor_size(hidden_states)}')
+        print_cuda_memory_usage(self.config.device)
 
         # prefill stage
+        print('='* 20 + ' Prefill ' + '='*20)
+        t = perf_counter()
         for layer_idx in range(self.num_hidden_layers):
             hidden_states = self.model.attention(True, hidden_states, layer_idx)
             hidden_states = self.model.mlp(hidden_states, layer_idx)
@@ -116,13 +119,18 @@ class VLMEngine:
 
         token_id, logits = self.model.output_head(hidden_states)
         output_ids.append(token_id)
-
-        self.print_memory_usage()
+        print_duration(t, perf_counter())
+        print(f'hidden_states size: {get_tensor_size(hidden_states)}')
+        print(f"first token_id={token_id}")
+        print_cuda_memory_usage(self.config.device)
 
         # decoding stage
+        print('='* 20 + ' Decoding ' + '='*20)
+        t = perf_counter()
         while not self.is_finished(output_ids):
             hidden_states = self.model.text_embed(token_id)
-            self.model.set_rotary_pos_emb(hidden_states, len(output_ids))
+            cur_pos_id = prompt_len + len(output_ids) - 1
+            self.model.set_rotary_pos_emb(hidden_states, cur_pos_id)
 
             for layer_idx in range(self.num_hidden_layers):
                 hidden_states = self.model.attention(False, hidden_states, layer_idx)
@@ -132,16 +140,14 @@ class VLMEngine:
             output_ids.append(token_id)
 
             print(f"step {len(output_ids)}: token_id={token_id}")
-            self.print_memory_usage()
+
+        print_duration(t, perf_counter())
+        print_cuda_memory_usage(self.config.device)
 
         # clean up kv cache
         self.kv_cache_manager.clear()
 
-        # print memory usage
-        cur_mem = torch.cuda.memory_allocated(self.config.device)
-        peak_mem = torch.cuda.max_memory_allocated(self.config.device)
-        print(f"Current memory allocated: {cur_mem / 1024 ** 3:.2f} GB")
-        print(f"Peak memory allocated: {peak_mem / 1024 ** 3:.2f} GB")
+        print_cuda_memory_usage(self.config.device)
 
         # return output text
         output_text = self.processor.batch_decode(

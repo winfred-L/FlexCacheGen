@@ -62,8 +62,12 @@ class Qwen3VLModel(nn.Module):
         self.kv_cache_manager = kv_cache_manager
 
         # components
+        config.hf_config.vision_config._attn_implementation = "flash_attention_2"
+        config.hf_config.vision_config.dtype = torch.bfloat16
         self.visual_model = Qwen3VLVisionModel(config.hf_config.vision_config) # use origin implementation
         self.language_model = Qwen3VLTextModel(config)
+        self.visual_model.to(dtype=torch.bfloat16)
+        self.language_model.to(dtype=torch.bfloat16)
         
         # load weights
         weight_files = glob.glob(os.path.join(config.model_path, "*.safetensors"))
@@ -150,7 +154,8 @@ class Qwen3VLModel(nn.Module):
 
     
     def text_embed(self, token_id: int) -> torch.Tensor:
-        return self.language_model.input_embed.forward(token_id)
+        hidden_states = torch.tensor([[token_id]], device=self.config.device, dtype=torch.long)
+        return self.language_model.input_embed.forward(hidden_states)
     
 
     def set_rotary_pos_emb(self, inputs_embeds: torch.Tensor, cur_pos_id: int):
