@@ -99,15 +99,13 @@ class VLMEngine:
         from torch.nn.attention import sdpa_kernel, SDPBackend
         t = perf_counter()
         with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
-            hidden_states = self.model.encoding(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                pixel_values_videos=inputs["pixel_values_videos"],
-                video_grid_thw=inputs["video_grid_thw"]
-            )
+            hidden_states = self.model.encoding(inputs)
         print_duration(t, perf_counter())
         print(f'hidden_states size: {get_tensor_size(hidden_states)}')
         print_cuda_memory_usage(self.config.device)
+
+        print(hidden_states)
+        import pdb; pdb.set_trace()
 
         # prefill stage
         print('='* 20 + ' Prefill ' + '='*20)

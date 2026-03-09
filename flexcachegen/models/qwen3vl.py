@@ -62,12 +62,10 @@ class Qwen3VLModel(nn.Module):
         self.kv_cache_manager = kv_cache_manager
 
         # components
-        config.hf_config.vision_config._attn_implementation = "flash_attention_2"
-        config.hf_config.vision_config.dtype = torch.bfloat16
+        # config.hf_config.vision_config._attn_implementation = "flash_attention_2"
+        # config.hf_config.vision_config.dtype = torch.bfloat16
         self.visual_model = Qwen3VLVisionModel(config.hf_config.vision_config) # use origin implementation
         self.language_model = Qwen3VLTextModel(config)
-        self.visual_model.to(dtype=torch.bfloat16)
-        self.language_model.to(dtype=torch.bfloat16)
         
         # load weights
         weight_files = glob.glob(os.path.join(config.model_path, "*.safetensors"))
@@ -107,6 +105,10 @@ class Qwen3VLModel(nn.Module):
         assert len(text_info.missing_keys) == 0, "Some text model weights are missing!"
         # print(f"Text Missing Keys: {text_info.missing_keys}")
         # print(f"Text Unexpected Keys: {text_info.unexpected_keys}")
+
+        # move to gpu
+        self.visual_model.to(device=self.config.device, dtype=torch.bfloat16).eval()
+        self.language_model.to(device=self.config.device, dtype=torch.bfloat16).eval()
         
         del state_dict, visual_state_dict, text_state_dict
         torch.cuda.empty_cache()
@@ -115,18 +117,21 @@ class Qwen3VLModel(nn.Module):
 
 
     def encoding(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        pixel_values_videos: torch.FloatTensor,
-        video_grid_thw: torch.LongTensor,
+        self, inputs
     ):
+        # get inputs
+        input_ids = inputs["input_ids"].to(self.config.device)
+        attention_mask = inputs["attention_mask"].to(self.config.device)
+        pixel_values_videos = inputs["pixel_values_videos"].to(self.config.device)
+        video_grid_thw = inputs["video_grid_thw"].to(self.config.device)
+
         # encode texts into embeddings
         inputs_embeds = self.language_model.input_embed(input_ids)
+        inputs_embeds = inputs_embeds.to(device=self.config.device, dtype=torch.bfloat16)
         
         # encode videos into embeddings
         video_embeds, deepstack_video_embeds = get_video_features(self.visual_model, pixel_values_videos, video_grid_thw)
-        video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.dtype)
+        video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
         
         # merge video embeddings into text embeddings
         _, video_mask = get_placeholder_mask(
@@ -139,13 +144,24 @@ class Qwen3VLModel(nn.Module):
         self.visual_pos_masks = video_mask[..., 0]
         self.deepstack_video_embeds = deepstack_video_embeds
 
+        # get attention_mask_tensor
+        attention_mask_tensor = (
+            attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
+        )
+        if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
+            attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
+            # Only apply conversion for floating point tensors (inverted masks)
+            if attention_mask_tensor.dtype.is_floating_point:
+                attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+                attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+
         # set position embeddings
         position_ids, rope_deltas = get_rope_index(
             config=self.config.hf_config, 
             input_ids=input_ids,
             image_grid_thw=None,
             video_grid_thw=video_grid_thw,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask_tensor,
         )
         self.rope_deltas = rope_deltas
         self.position_embeddings = self.language_model.rotary_emb(inputs_embeds, position_ids)
