@@ -104,8 +104,8 @@ class VLMEngine:
         print(f'hidden_states size: {get_tensor_size(hidden_states)}')
         print_cuda_memory_usage(self.config.device)
 
-        print(hidden_states)
-        import pdb; pdb.set_trace()
+        # print(hidden_states)
+        # import pdb; pdb.set_trace()
 
         # prefill stage
         print('='* 20 + ' Prefill ' + '='*20)
@@ -151,4 +151,9 @@ class VLMEngine:
         output_text = self.processor.batch_decode(
             [output_ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
+
+        print(output_ids)
+        print(output_text)
+        import pdb; pdb.set_trace()
+
         return output_text

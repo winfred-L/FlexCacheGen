@@ -1,10 +1,8 @@
 import os
 import torch
-from dataclasses import dataclass
 from transformers import AutoConfig
 
 
-@dataclass
 class Config:
     # model settings
     model_path: str
@@ -12,7 +10,7 @@ class Config:
 
     # generation settings
     temperature: float = 0.0
-    max_new_tokens: int = 256
+    max_new_tokens: int = 128
     eos_token_id: tuple[int] = (151645, 151643)
     device = torch.device('cuda:1')
 
