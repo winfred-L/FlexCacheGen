@@ -96,20 +96,18 @@ class Qwen3VLTextAttention(nn.Module):
         k = self.k_norm(k)
 
         # do rotary position embedding
-        q = q.transpose(1, 2)
+        q = q.transpose(1, 2) # (b, h, s, d)
         k = k.transpose(1, 2)
         cos, sin = position_embeddings
         q, k = self.apply_rotary_pos_emb(
             q, k, cos, sin
         )
-        q = q.transpose(1, 2).contiguous()
+        q = q.transpose(1, 2).contiguous() # (b, s, h, d)
         k = k.transpose(1, 2).contiguous()
 
         if is_prefill:
             # store kv to kv cache pool
-            kv_cache_manager.gpu_k_buffer[self.layer_idx][:, :seq_len].copy_(k)
-            kv_cache_manager.gpu_v_buffer[self.layer_idx][:, :seq_len].copy_(v)
-            kv_cache_manager.cache_seqlens[self.layer_idx].fill_(seq_len)
+            kv_cache_manager.gpu_buffer[self.layer_idx].update(k,v)
             kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
 
             # attention computation
@@ -118,19 +116,12 @@ class Qwen3VLTextAttention(nn.Module):
         
         else: # decoding stage
             # retrieve kv to GPU from kv cache pool
-            kv_cache_manager.load_layer_to_gpu(self.layer_idx)
+            cache_layer = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
+            k_cache, v_cache = cache_layer.update(k,v)
 
             # attention computation
-            # flash_attn_with_kvcache() will update kv cache inside
-            attn_output = flash_attn_with_kvcache(
-                q=q,
-                k_cache=kv_cache_manager.gpu_k_buffer[self.layer_idx],
-                v_cache=kv_cache_manager.gpu_v_buffer[self.layer_idx],
-                k=k,
-                v=v,
-                cache_seqlens=kv_cache_manager.cache_seqlens[self.layer_idx],
-                causal=True
-            )
+            # Note: causal=False is correct here because a query length of 1
+            attn_output = flash_attn_func(q, k_cache, v_cache, causal=False)
 
             # store kv to kv cache pool
             kv_cache_manager.offload_layer_to_cpu(self.layer_idx)

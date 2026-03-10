@@ -95,6 +95,8 @@ class VLMEngine:
         inputs = inputs.to(self.config.device)
         prompt_len = inputs["input_ids"].shape[1]
         print_cuda_memory_usage(self.config.device)
+
+        print(f"{inputs.input_ids.shape=}")
         
         # 2. encoding stage
         hidden_states = self.model.encoding(inputs)
@@ -122,8 +124,5 @@ class VLMEngine:
         output_text = self.processor.batch_decode(
             [output_ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
-
-        print(output_ids)
-        print(output_text)
 
         return output_text

@@ -5,7 +5,8 @@ def main():
     vlm = VLMEngine(model_path)
     
     samples = [
-        ("/home/lyc/FlexLLMGen/test/video/28s.mp4", 'Please describe this video in detail.'),
+        # ("./test/video/28s.mp4", 'Please describe this video in detail.'),
+        ("/data1/lyc/datasets/MLVU/MLVU/video/9_summary/217.mp4", 'Please describe this video in detail.'),
     ]
     outputs = []
     
@@ -14,10 +15,11 @@ def main():
         outputs.append(output)
 
     for (video_path, question), output in zip(samples, outputs):
-        print("\n")
+        print("="*20 + "input" + "="*20)
         print(f"Video: {video_path}")
-        print(f"Question: {question!r}")
-        print(f"Output: {output!r}") # use !r to show quotes
+        print(f"Question: {question}")
+        print("="*20 + "output" + "="*20)
+        print(output)
 
 if __name__ == "__main__":
     main()
