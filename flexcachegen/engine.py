@@ -75,7 +75,6 @@ class VLMEngine:
         return token_id, logits
     
 
-    @print_duration
     def decoding(self, token_id: int, cur_pos_id: int):
         hidden_states = self.model.text_embed(token_id)
         self.model.set_rotary_pos_emb(hidden_states, cur_pos_id)
@@ -107,10 +106,12 @@ class VLMEngine:
         print_cuda_memory_usage(self.config.device)
 
         # 4. decoding stage
+        t = perf_counter()
         while not self.is_finished(output_ids):
             cur_pos_id = prompt_len + len(output_ids) - 1
             token_id, logits = self.decoding(token_id, cur_pos_id)
             output_ids.append(token_id)
+        print(f"[decoding] Duration: {perf_counter() - t:.2f} seconds")
         print_cuda_memory_usage(self.config.device)
 
         # 5. clean up kv cache

@@ -13,11 +13,11 @@ class KVCacheManager:
         head_dim = config.hf_config.text_config.hidden_size // config.hf_config.text_config.num_attention_heads
 
         self.gpu_k_buffer = [
-            torch.empty(batch, seq, num_kv_heads, head_dim, device=config.device, dtype=torch.bfloat16)
+            torch.empty(batch, seq, num_kv_heads, head_dim, device=self.config.device, dtype=self.config.dtype)
             for _ in range(self.num_hidden_layers)
         ]
         self.gpu_v_buffer = [
-            torch.empty(batch, seq, num_kv_heads, head_dim, device=config.device, dtype=torch.bfloat16)
+            torch.empty(batch, seq, num_kv_heads, head_dim, device=self.config.device, dtype=self.config.dtype)
             for _ in range(self.num_hidden_layers)
         ]
 
@@ -31,7 +31,6 @@ class KVCacheManager:
 
     def clear(self):
         pass
-
 
 
 class BasicKVCacheManager(KVCacheManager):

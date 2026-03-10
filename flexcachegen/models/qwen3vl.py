@@ -251,53 +251,51 @@ class Qwen3VLModel(nn.Module):
         # components
         self.visual_model = Qwen3VLVisionModel._from_config(config.hf_config.vision_config) # use origin implementation
         self.language_model = Qwen3VLTextModel(config)
+
+        self.visual_model.to(device=self.config.device).eval() # actually torch.float32 !!!
+        self.language_model.to(device=self.config.device, dtype=self.config.dtype).eval()
         
         # load weights
         weight_files = glob.glob(os.path.join(config.model_path, "*.safetensors"))
         if not weight_files:
             raise RuntimeError(f"No weight files found in {config.model_path}")
         
-        state_dict = {}
-        for f in weight_files:
-            shard = load_file(f, device="cpu")
-            state_dict.update(shard)
+        visual_state_dict = {}
+        text_state_dict = {}
 
-        visual_state_dict = {
-            k.replace("model.visual.", ""): v 
-            for k, v in state_dict.items() if k.startswith("model.visual.")
-        }
-        visual_info = self.visual_model.load_state_dict(visual_state_dict, strict=False)
+        for f in weight_files:
+            shard = load_file(f, device="cuda")
+            for k, v in shard.items():
+                if k.startswith("model.visual."):
+                    new_k = k.replace("model.visual.", "")
+                    visual_state_dict[new_k] = v
+                elif k.startswith("model.language_model."):
+                    new_k = k.replace("model.language_model.", "")
+                    if new_k == "embed_tokens.weight":
+                        new_k = "input_embed.embed_tokens.weight"
+                    elif ".input_layernorm." in new_k:
+                        new_k = new_k.replace("input_layernorm", "self_attn.input_layernorm")
+                    elif ".post_attention_layernorm." in new_k:
+                        new_k = new_k.replace("post_attention_layernorm", "mlp.post_attention_layernorm")
+                    elif new_k == "norm.weight":
+                        new_k = "output_head.norm.weight"
+                    text_state_dict[new_k] = v
+                elif k == "lm_head.weight":
+                    text_state_dict["output_head.lm_head.weight"] = v
+            del shard
+
+        visual_info = self.visual_model.load_state_dict(visual_state_dict, strict=True)
+        text_info = self.language_model.load_state_dict(text_state_dict, strict=True)
+
         assert len(visual_info.missing_keys) == 0, "Some visual model weights are missing!"
         # print(f"Vision Missing Keys: {visual_info.missing_keys}")
         # print(f"Vision Unexpected Keys: {visual_info.unexpected_keys}")
-
-        text_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith("model.language_model."):
-                new_k = k.replace("model.language_model.", "")
-                if new_k == "embed_tokens.weight":
-                    new_k = "input_embed.embed_tokens.weight"
-                elif ".input_layernorm." in new_k:
-                    new_k = new_k.replace("input_layernorm", "self_attn.input_layernorm")
-                elif ".post_attention_layernorm." in new_k:
-                    new_k = new_k.replace("post_attention_layernorm", "mlp.post_attention_layernorm")
-                elif new_k == "norm.weight":
-                    new_k = "output_head.norm.weight"
-                text_state_dict[new_k] = v
-            elif k == "lm_head.weight":
-                text_state_dict["output_head.lm_head.weight"] = v
-        text_info = self.language_model.load_state_dict(text_state_dict, strict=False)
         assert len(text_info.missing_keys) == 0, "Some text model weights are missing!"
         # print(f"Text Missing Keys: {text_info.missing_keys}")
         # print(f"Text Unexpected Keys: {text_info.unexpected_keys}")
-
-        # move to gpu
-        self.visual_model.to(device=self.config.device).eval() # actually torch.float32 !!!
-        self.language_model.to(device=self.config.device, dtype=self.config.dtype).eval()
         
-        del state_dict, visual_state_dict, text_state_dict
-        torch.cuda.empty_cache()
-
+        del visual_state_dict, text_state_dict
+        
         print("Qwen3VLModel init done.")
 
     @print_duration
