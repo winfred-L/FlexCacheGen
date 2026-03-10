@@ -1,5 +1,6 @@
 import torch
 from time import perf_counter
+from functools import wraps
 
 def get_tensor_size(tensor: torch.Tensor) -> str:
     num_elements = tensor.nelement()
@@ -23,6 +24,12 @@ def print_cuda_memory_usage(device: torch.device):
     print(f"Peak memory allocated: {peak_mem / 1024 ** 3:.2f} GB")
 
 
-def print_duration(start, end):
-    duration = end - start
-    print(f"Duration: {duration:.2f} seconds")
+def print_duration(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        t = perf_counter()
+        result = func(*args, **kwargs)
+        duration = perf_counter() - t
+        print(f"[{func.__name__}] Duration: {duration:.2f} seconds")
+        return result
+    return wrapper

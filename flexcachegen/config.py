@@ -7,12 +7,13 @@ class Config:
     # model settings
     model_path: str
     hf_config: AutoConfig
+    dtype = torch.bfloat16
 
     # generation settings
     temperature: float = 0.0
     max_new_tokens: int = 128
     eos_token_id: tuple[int] = (151645, 151643)
-    device = torch.device('cuda:1')
+    device = torch.device('cuda:0')
 
 
     # unused

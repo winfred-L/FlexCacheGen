@@ -5,7 +5,7 @@ def main():
     vlm = VLMEngine(model_path)
     
     samples = [
-        ("/data1/lyc/datasets/MLVU/MLVU/video/9_summary/217.mp4", 'Please describe this video in detail.'),
+        ("/home/lyc/FlexLLMGen/test/video/28s.mp4", 'Please describe this video in detail.'),
     ]
     outputs = []
     

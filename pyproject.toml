@@ -16,7 +16,6 @@ dependencies = [
     "qwen_vl_utils",
     "triton",
     "xxhash",
-    "torchinfo",
 ]
 
 [tool.setuptools.packages.find]

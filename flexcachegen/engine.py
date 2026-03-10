@@ -1,10 +1,6 @@
 import torch
-from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
-
-import sys
-from torchinfo import summary
 
 from transformers import AutoProcessor
 
@@ -16,7 +12,7 @@ from flexcachegen.utils import get_tensor_size, print_cuda_memory_usage, print_d
 
 class VLMEngine:
     '''
-    VLMEngine controls the generation process, including computation stage and kv cache IO.
+    VLMEngine controls the generation process, scheduling unimplemented.
     '''
 
     def __init__(self, model_path, **kwargs):
@@ -32,7 +28,7 @@ class VLMEngine:
         self.processor = AutoProcessor.from_pretrained(self.config.model_path, use_fast=True)
         self.num_hidden_layers = self.config.hf_config.text_config.num_hidden_layers
 
-
+    @print_duration
     def process_input(
         self,
         video_path: str,
@@ -69,91 +65,64 @@ class VLMEngine:
         return output_ids[-1] in self.config.eos_token_id or len(output_ids) >= self.config.max_new_tokens
     
 
-    def print_inputs_size(self, inputs_dict):
-        total_bytes = 0
-        for k, v in inputs_dict.items():
-            if torch.is_tensor(v):
-                v_bytes = v.nelement() * v.element_size()
-                total_bytes += v_bytes
-                print(f"Input key: {k}, type: {type(v)}, shape: {v.shape}, dtype: {v.dtype}, size: {v_bytes / (1024 ** 2):.2f} MB")
-
-        total_mb = total_bytes / (1024 ** 2)
-        print(f"Total inputs size: {total_mb:.2f} MB")
-
-    @torch.inference_mode()
-    def generate_single(self, video_path: str, question: str):
-        output_ids = []
-
-        # process input
-        print('='* 20 + ' Process Input ' + '='*20)
-        t = perf_counter()
-        inputs = self.process_input(video_path, question)
-        inputs = inputs.to(self.config.device)
-        prompt_len = inputs["input_ids"].shape[1]
-        print_duration(t, perf_counter())
-        self.print_inputs_size(inputs)
-        print_cuda_memory_usage(self.config.device)
-        
-        # encoding step
-        print('='* 20 + ' Encoding ' + '='*20)
-        from torch.nn.attention import sdpa_kernel, SDPBackend
-        t = perf_counter()
-        with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
-            hidden_states = self.model.encoding(inputs)
-        print_duration(t, perf_counter())
-        print(f'hidden_states size: {get_tensor_size(hidden_states)}')
-        print_cuda_memory_usage(self.config.device)
-
-        # print(hidden_states)
-        # import pdb; pdb.set_trace()
-
-        # prefill stage
-        print('='* 20 + ' Prefill ' + '='*20)
-        t = perf_counter()
+    @print_duration
+    def prefill(self, hidden_states: torch.Tensor):
         for layer_idx in range(self.num_hidden_layers):
             hidden_states = self.model.attention(True, hidden_states, layer_idx)
             hidden_states = self.model.mlp(hidden_states, layer_idx)
             hidden_states = self.model.merge_visual_features(hidden_states, layer_idx)
-
         token_id, logits = self.model.output_head(hidden_states)
+        return token_id, logits
+    
+
+    @print_duration
+    def decoding(self, token_id: int, cur_pos_id: int):
+        hidden_states = self.model.text_embed(token_id)
+        self.model.set_rotary_pos_emb(hidden_states, cur_pos_id)
+        for layer_idx in range(self.num_hidden_layers):
+            hidden_states = self.model.attention(False, hidden_states, layer_idx)
+            hidden_states = self.model.mlp(hidden_states, layer_idx)
+        token_id, logits = self.model.output_head(hidden_states)
+        return token_id, logits
+
+
+    @torch.inference_mode()
+    @print_duration
+    def generate_single(self, video_path: str, question: str):
+        output_ids = []
+
+        # 1. process input
+        inputs = self.process_input(video_path, question)
+        inputs = inputs.to(self.config.device)
+        prompt_len = inputs["input_ids"].shape[1]
+        print_cuda_memory_usage(self.config.device)
+        
+        # 2. encoding stage
+        hidden_states = self.model.encoding(inputs)
+        print_cuda_memory_usage(self.config.device)
+
+        # 3. prefill stage
+        token_id, logits = self.prefill(hidden_states)
         output_ids.append(token_id)
-        print_duration(t, perf_counter())
-        print(f'hidden_states size: {get_tensor_size(hidden_states)}')
-        print(f"first token_id={token_id}")
         print_cuda_memory_usage(self.config.device)
 
-        # decoding stage
-        print('='* 20 + ' Decoding ' + '='*20)
-        t = perf_counter()
+        # 4. decoding stage
         while not self.is_finished(output_ids):
-            hidden_states = self.model.text_embed(token_id)
             cur_pos_id = prompt_len + len(output_ids) - 1
-            self.model.set_rotary_pos_emb(hidden_states, cur_pos_id)
-
-            for layer_idx in range(self.num_hidden_layers):
-                hidden_states = self.model.attention(False, hidden_states, layer_idx)
-                hidden_states = self.model.mlp(hidden_states, layer_idx)
-
-            token_id, logits = self.model.output_head(hidden_states)
+            token_id, logits = self.decoding(token_id, cur_pos_id)
             output_ids.append(token_id)
-
-            print(f"step {len(output_ids)}: token_id={token_id}")
-
-        print_duration(t, perf_counter())
         print_cuda_memory_usage(self.config.device)
 
-        # clean up kv cache
+        # 5. clean up kv cache
         self.kv_cache_manager.clear()
-
         print_cuda_memory_usage(self.config.device)
 
-        # return output text
+        # 6. decode output text
         output_text = self.processor.batch_decode(
             [output_ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
 
         print(output_ids)
         print(output_text)
-        import pdb; pdb.set_trace()
 
         return output_text
