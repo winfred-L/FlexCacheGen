@@ -232,7 +232,7 @@ class Qwen3VLTextModel(nn.Module):
 class Qwen3VLModel(nn.Module):
     '''
     Computation implementation of Qwen3VLModel, providing computing stage APIs for VLMEngine.
-    KV cache IO is managed by KVCacheManager in VLMEngine, not here.
+    KV cache is managed by KVCacheManager, not here.
     '''
 
     rope_deltas = None
@@ -251,7 +251,7 @@ class Qwen3VLModel(nn.Module):
         self.visual_model = Qwen3VLVisionModel._from_config(config.hf_config.vision_config) # use origin implementation
         self.language_model = Qwen3VLTextModel(config)
 
-        self.visual_model.to(device=self.config.device).eval() # actually torch.float32 !!!
+        self.visual_model.to(device=self.config.device).eval() # actually torch.float32! set to bfloat16 will drop speed
         self.language_model.to(device=self.config.device, dtype=self.config.dtype).eval()
         
         # load weights
@@ -295,7 +295,6 @@ class Qwen3VLModel(nn.Module):
         
         del visual_state_dict, text_state_dict
         
-        print("Qwen3VLModel init done.")
 
     @print_duration
     def encoding(self, inputs):
@@ -355,15 +354,17 @@ class Qwen3VLModel(nn.Module):
         return self.language_model.input_embed.forward(hidden_states)
     
 
-    def set_rotary_pos_emb(self, inputs_embeds: torch.Tensor, cur_pos_id: int):
-        # set position embeddings to be shared across all attention layers
-        # do after input embedding layer, before all attention layers
+    def set_rotary_pos_emb(self, inputs_embeds: torch.Tensor, cur_pos_idx: int):
+        """
+        set position embeddings to be shared across all attention layers.
+        do after input embedding layer, before all attention layers (only decoding).
+        """
         inputs_embeds = inputs_embeds.to(device=self.config.device)
 
         batch_size, seq_length, _ = inputs_embeds.shape
         position_ids = torch.arange(seq_length, device=inputs_embeds.device)
         position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-        delta = (cur_pos_id + self.rope_deltas).to(inputs_embeds.device)
+        delta = (cur_pos_idx + self.rope_deltas).to(inputs_embeds.device)
         delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
         position_ids = position_ids.add(delta)
         position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
@@ -400,7 +401,7 @@ class Qwen3VLModel(nn.Module):
         hidden_states: torch.Tensor,
         layer_idx: int,
     ) -> torch.Tensor:
-        # add visual features to the hidden states of first several decoder layers (only prefill)
+        """add visual features to the hidden states of first several decoder layers (only prefill)"""
         if layer_idx < len(self.deepstack_video_embeds):
             visual_pos_masks = self.visual_pos_masks.to(device=hidden_states.device)
             deepstack_video_embeds = self.deepstack_video_embeds[layer_idx].to(device=hidden_states.device, dtype=hidden_states.dtype)

@@ -12,7 +12,8 @@ from flexcachegen.utils import get_tensor_size, print_cuda_memory_usage, print_d
 
 class VLMEngine:
     '''
-    VLMEngine controls the generation process, scheduling unimplemented.
+    VLMEngine controls the generation process, scheduling logic is unimplemented.
+    Only support single GPU single batch inference now.
     '''
 
     def __init__(self, model_path, **kwargs):
@@ -75,9 +76,9 @@ class VLMEngine:
         return token_id, logits
     
 
-    def decoding(self, token_id: int, cur_pos_id: int):
+    def decoding(self, token_id: int, cur_pos_idx: int):
         hidden_states = self.model.text_embed(token_id)
-        self.model.set_rotary_pos_emb(hidden_states, cur_pos_id)
+        self.model.set_rotary_pos_emb(hidden_states, cur_pos_idx)
         for layer_idx in range(self.num_hidden_layers):
             hidden_states = self.model.attention(False, hidden_states, layer_idx)
             hidden_states = self.model.mlp(hidden_states, layer_idx)
@@ -110,8 +111,8 @@ class VLMEngine:
         # 4. decoding stage
         t = perf_counter()
         while not self.is_finished(output_ids):
-            cur_pos_id = prompt_len + len(output_ids) - 1
-            token_id, logits = self.decoding(token_id, cur_pos_id)
+            cur_pos_idx = prompt_len + len(output_ids) - 1
+            token_id, logits = self.decoding(token_id, cur_pos_idx)
             output_ids.append(token_id)
         print(f"[decoding] Duration: {perf_counter() - t:.2f} seconds")
         print_cuda_memory_usage(self.config.device)

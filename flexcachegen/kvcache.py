@@ -2,16 +2,15 @@ import torch
 from flexcachegen.config import Config
 # from transformers.cache_utils import DynamicLayer
 
-class DynamicLayer:
+class CacheLayer:
     """
     A cache layer that grows dynamically as more tokens are generated.
     It stores the key and value states as tensors of shape `[batch_size, seq_len, num_heads, head_dim]`.
-    
-    ref: transformers.cache_utils.DynamicLayer
+    The max capacity is allocated after prefill and limited by `config.max_new_tokens`.
+    New decoding KV is updated in flash-attn kernel `flash_attn_with_kvcache`, only `seq_len` needs manually controlled.
     """
     
     def __init__(self, max_new_tokens):
-        # self.is_initialized = False
         self.seq_len = 0
         self.max_seq_len = 0
         self.max_new_tokens = max_new_tokens
@@ -39,28 +38,7 @@ class DynamicLayer:
         )
         self.keys[:, :seq_len].copy_(key_states)
         self.values[:, :seq_len].copy_(value_states)
-        # self.is_initialized = True
-        
 
-    # def update(
-    #     self,
-    #     key_states: torch.Tensor,
-    #     value_states: torch.Tensor,
-    # ):
-    #     """
-    #     Update the key and value caches in-place, and return the updated keys and value states.
-    #     """
-    #     # prefill stage
-    #     if not self.is_initialized:
-    #         self.lazy_initialization(key_states, value_states)
-    #     # decoding stage
-    #     else:
-    #         assert self.seq_len < self.max_seq_len
-    #         self.keys[:, self.seq_len : self.seq_len + 1].copy_(key_states)
-    #         self.values[:, self.seq_len : self.seq_len + 1].copy_(value_states)
-    #         self.seq_len += 1
-
-    #     return self.keys[:, :self.seq_len], self.values[:, :self.seq_len]
         
     
 
@@ -69,17 +47,18 @@ class KVCacheManager:
         self.config = config
         self.num_hidden_layers = config.hf_config.text_config.num_hidden_layers
 
-        self.gpu_buffer = [DynamicLayer(self.config.max_new_tokens) for _ in range(self.num_hidden_layers)]
+        self.gpu_buffer = [CacheLayer(self.config.max_new_tokens) for _ in range(self.num_hidden_layers)]
     
     def offload_layer_to_cpu(self, layer_idx):
         # TODO
         pass
     
     def load_layer_to_gpu(self, layer_idx):
+        # do nothing now, only return specific layer's cache
         return self.gpu_buffer[layer_idx]
 
     def clear(self):
-        self.gpu_buffer = [DynamicLayer(self.config.max_new_tokens) for _ in range(self.num_hidden_layers)]
+        self.gpu_buffer = [CacheLayer(self.config.max_new_tokens) for _ in range(self.num_hidden_layers)]
 
 
 
