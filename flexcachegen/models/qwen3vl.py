@@ -2,7 +2,7 @@ import glob
 import os
 import torch
 from torch import nn
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from typing import Optional
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel, Qwen3VLTextRotaryEmbedding, Qwen3VLTextRMSNorm
 
@@ -255,36 +255,52 @@ class Qwen3VLModel(nn.Module):
         self.language_model.to(device=self.config.device, dtype=self.config.dtype).eval()
         
         # load weights
-        weight_files = glob.glob(os.path.join(config.model_path, "*.safetensors"))
-        if not weight_files:
-            raise RuntimeError(f"No weight files found in {config.model_path}")
-        
-        visual_state_dict = {}
-        text_state_dict = {}
+        processed_visual_model_path = os.path.join(config.model_path, "visual_model.safetensors")
+        processed_language_model_path = os.path.join(config.model_path, "language_model.safetensors")
 
-        for f in weight_files:
-            shard = load_file(f, device="cuda")
-            for k, v in shard.items():
-                if k.startswith("model.visual."):
-                    new_k = k.replace("model.visual.", "")
-                    visual_state_dict[new_k] = v
-                elif k.startswith("model.language_model."):
-                    new_k = k.replace("model.language_model.", "")
-                    if new_k == "embed_tokens.weight":
-                        new_k = "input_embed.embed_tokens.weight"
-                    elif ".input_layernorm." in new_k:
-                        new_k = new_k.replace("input_layernorm", "self_attn.input_layernorm")
-                    elif ".post_attention_layernorm." in new_k:
-                        new_k = new_k.replace("post_attention_layernorm", "mlp.post_attention_layernorm")
-                    elif new_k == "norm.weight":
-                        new_k = "output_head.norm.weight"
-                    text_state_dict[new_k] = v
-                elif k == "lm_head.weight":
-                    text_state_dict["output_head.lm_head.weight"] = v
-            del shard
+        if os.path.exists(processed_visual_model_path) and os.path.exists(processed_language_model_path):
+            # if exist processed weight files, direct load to gpu
+            visual_state_dict = load_file(processed_visual_model_path, device=str(self.config.device))
+            text_state_dict = load_file(processed_language_model_path, device=str(self.config.device))
 
-        visual_info = self.visual_model.load_state_dict(visual_state_dict, strict=True)
-        text_info = self.language_model.load_state_dict(text_state_dict, strict=True)
+            visual_info = self.visual_model.load_state_dict(visual_state_dict, strict=True)
+            text_info = self.language_model.load_state_dict(text_state_dict, strict=True)
+
+        else:
+            # process origin huggingface weight files, and save to the same directory
+            weight_files = glob.glob(os.path.join(config.model_path, "*.safetensors"))
+            if not weight_files:
+                raise RuntimeError(f"No weight files found in {config.model_path}")
+            
+            visual_state_dict = {}
+            text_state_dict = {}
+
+            for f in weight_files:
+                shard = load_file(f, device="cuda")
+                for k, v in shard.items():
+                    if k.startswith("model.visual."):
+                        new_k = k.replace("model.visual.", "")
+                        visual_state_dict[new_k] = v
+                    elif k.startswith("model.language_model."):
+                        new_k = k.replace("model.language_model.", "")
+                        if new_k == "embed_tokens.weight":
+                            new_k = "input_embed.embed_tokens.weight"
+                        elif ".input_layernorm." in new_k:
+                            new_k = new_k.replace("input_layernorm", "self_attn.input_layernorm")
+                        elif ".post_attention_layernorm." in new_k:
+                            new_k = new_k.replace("post_attention_layernorm", "mlp.post_attention_layernorm")
+                        elif new_k == "norm.weight":
+                            new_k = "output_head.norm.weight"
+                        text_state_dict[new_k] = v
+                    elif k == "lm_head.weight":
+                        text_state_dict["output_head.lm_head.weight"] = v
+                del shard
+
+            visual_info = self.visual_model.load_state_dict(visual_state_dict, strict=True)
+            text_info = self.language_model.load_state_dict(text_state_dict, strict=True)
+
+            save_file(visual_state_dict, processed_visual_model_path, metadata={"format": "pt", "component": "vision"})
+            save_file(text_state_dict, processed_language_model_path, metadata={"format": "pt", "component": "text"})
 
         assert len(visual_info.missing_keys) == 0, "Some visual model weights are missing!"
         # print(f"Vision Missing Keys: {visual_info.missing_keys}")
@@ -292,8 +308,9 @@ class Qwen3VLModel(nn.Module):
         assert len(text_info.missing_keys) == 0, "Some text model weights are missing!"
         # print(f"Text Missing Keys: {text_info.missing_keys}")
         # print(f"Text Unexpected Keys: {text_info.unexpected_keys}")
-        
+
         del visual_state_dict, text_state_dict
+        torch.cuda.empty_cache()
         
 
     @print_duration

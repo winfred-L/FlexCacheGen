@@ -2,7 +2,7 @@ import os
 import torch
 from transformers import AutoConfig
 
-
+# TODO: currently only support for qwen3vl-8b
 class Config:
     # model settings
     model_path: str
