@@ -3,6 +3,7 @@ from time import perf_counter
 from tqdm.auto import tqdm
 
 from transformers import AutoProcessor
+from qwen_vl_utils import process_vision_info
 
 from flexcachegen.config import Config
 from flexcachegen.kvcache import KVCacheManager
@@ -45,21 +46,63 @@ class VLMEngine:
                     {
                         "type": "video",
                         "video": video_path,
-                        "max_pixels": 360 * 420,
-                        "fps": 1.0,
+                        # restrict the resolution of individual frames in the video
+                        # "min_pixels": 4 * 32 * 32,
+                        # "max_pixels": 640 * 32 * 32,
+                        # limit the total number of tokens in the video
+                        "total_pixels": 64 * 1024 * 32 * 32, # 64k tokens
+                        # accept either `fps` or `nframes`
+                        # "fps": 2.0,
+                        # "nframes": 32, #2048,
                     },
                     {"type": "text", "text": question},
                 ],
             }
         ]
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt"
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        images, videos, video_kwargs = process_vision_info(messages, image_patch_size=16, return_video_kwargs=True, return_video_metadata=True)
+
+        # each video returns as (video_tensor, video_metadata)
+        # split the videos and according metadatas
+        if videos is not None:
+            videos, video_metadatas = zip(*videos)
+            videos, video_metadatas = list(videos), list(video_metadatas)
+        else:
+            video_metadatas = None
+        
+        inputs = self.processor(
+            text=text,
+            images=images,
+            videos=videos,
+            video_metadata=video_metadatas,
+            return_tensors="pt",
+            do_resize=False, # avoid duplicate resizing
+            **video_kwargs
         )
         return inputs
+    
+        # messages = [
+        #     {
+        #         "role": "user",
+        #         "content": [
+        #             {
+        #                 "type": "video",
+        #                 "video": video_path,
+        #                 "max_pixels": 360 * 420,
+        #                 "fps": 1.0,
+        #             },
+        #             {"type": "text", "text": question},
+        #         ],
+        #     }
+        # ]
+        # inputs = self.processor.apply_chat_template(
+        #     messages,
+        #     tokenize=True,
+        #     add_generation_prompt=True,
+        #     return_dict=True,
+        #     return_tensors="pt"
+        # )
+        # return inputs
 
     
     def is_finished(self, output_ids: list[int]) -> bool:
@@ -95,18 +138,18 @@ class VLMEngine:
         inputs = self.process_input(video_path, question)
         inputs = inputs.to(self.config.device)
         prompt_len = inputs["input_ids"].shape[1]
-        print_cuda_memory_usage(self.config.device)
+        # print_cuda_memory_usage(self.config.device)
 
         print(f"{inputs.input_ids.shape=}")
         
         # 2. encoding stage
         hidden_states = self.model.encoding(inputs)
-        print_cuda_memory_usage(self.config.device)
+        # print_cuda_memory_usage(self.config.device)
 
         # 3. prefill stage
         token_id, logits = self.prefill(hidden_states)
         output_ids.append(token_id)
-        print_cuda_memory_usage(self.config.device)
+        # print_cuda_memory_usage(self.config.device)
 
         # 4. decoding stage
         t = perf_counter()
@@ -115,11 +158,11 @@ class VLMEngine:
             token_id, logits = self.decoding(token_id, cur_pos_idx)
             output_ids.append(token_id)
         print(f"[decoding] Duration: {perf_counter() - t:.2f} seconds")
-        print_cuda_memory_usage(self.config.device)
+        # print_cuda_memory_usage(self.config.device)
 
         # 5. clean up kv cache
         self.kv_cache_manager.clear()
-        print_cuda_memory_usage(self.config.device)
+        # print_cuda_memory_usage(self.config.device)
 
         # 6. decode output text
         output_text = self.processor.batch_decode(

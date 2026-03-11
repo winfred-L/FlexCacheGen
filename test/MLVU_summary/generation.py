@@ -16,8 +16,6 @@ def main():
     with open(json_file_path, 'r', encoding='utf-8') as f:
         dataset = json.load(f)
 
-    dataset = dataset[:3]
-
     # generation
     results = []
     for sample in tqdm(dataset):

@@ -6,7 +6,7 @@ def main():
     
     samples = [
         # ("./test/video/28s.mp4", 'Please describe this video in detail.'),
-        ("/data1/lyc/datasets/MLVU/MLVU/video/9_summary/217.mp4", 'Please describe this video in detail.'),
+        ("/data1/lyc/datasets/MLVU/MLVU/video/9_summary/217.mp4", 'Please summarize this video, including its main content.'),
     ]
     outputs = []
     
