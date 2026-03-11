@@ -16,6 +16,8 @@ dependencies = [
     "qwen_vl_utils",
     "triton",
     "xxhash",
+    "openai",
+    "dotenv",
 ]
 
 [tool.setuptools.packages.find]
