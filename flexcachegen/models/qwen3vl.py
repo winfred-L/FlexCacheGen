@@ -107,7 +107,7 @@ class Qwen3VLTextAttention(nn.Module):
 
         if is_prefill:
             # store kv to kv cache pool
-            kv_cache_manager.gpu_buffer[self.layer_idx].update(k,v)
+            kv_cache_manager.gpu_buffer[self.layer_idx].lazy_initialization(k,v)
             kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
 
             # attention computation
@@ -117,11 +117,19 @@ class Qwen3VLTextAttention(nn.Module):
         else: # decoding stage
             # retrieve kv to GPU from kv cache pool
             cache_layer = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
-            k_cache, v_cache = cache_layer.update(k,v)
 
             # attention computation
-            # Note: causal=False is correct here because a query length of 1
-            attn_output = flash_attn_func(q, k_cache, v_cache, causal=False)
+            # flash_attn_with_kvcache() will update kv cache inside
+            attn_output = flash_attn_with_kvcache(
+                q=q,
+                k_cache=cache_layer.keys,
+                v_cache=cache_layer.values,
+                k=k,
+                v=v,
+                cache_seqlens=cache_layer.seq_len,
+                causal=True,
+            )
+            cache_layer.seq_len += 1
 
             # store kv to kv cache pool
             kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
@@ -348,6 +356,8 @@ class Qwen3VLModel(nn.Module):
     
 
     def set_rotary_pos_emb(self, inputs_embeds: torch.Tensor, cur_pos_id: int):
+        # set position embeddings to be shared across all attention layers
+        # do after input embedding layer, before all attention layers
         inputs_embeds = inputs_embeds.to(device=self.config.device)
 
         batch_size, seq_length, _ = inputs_embeds.shape

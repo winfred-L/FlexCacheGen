@@ -18,10 +18,9 @@ def get_tensor_size(tensor: torch.Tensor) -> str:
     
 
 def print_cuda_memory_usage(device: torch.device):
-    cur_mem = torch.cuda.memory_allocated(device)
-    peak_mem = torch.cuda.max_memory_allocated(device)
-    print(f"Current memory allocated: {cur_mem / 1024 ** 3:.2f} GB")
-    print(f"Peak memory allocated: {peak_mem / 1024 ** 3:.2f} GB")
+    cur_mem = torch.cuda.memory_allocated(device) / 1024 ** 3
+    peak_mem = torch.cuda.max_memory_allocated(device) / 1024 ** 3
+    print(f"Memory Usage: Current {cur_mem:.2f} GB, Peak {peak_mem:.2f} GB")
 
 
 def print_duration(func):

@@ -11,7 +11,7 @@ class Config:
 
     # generation settings
     temperature: float = 0.0
-    max_new_tokens: int = 2048
+    max_new_tokens: int = 1024
     eos_token_id: tuple[int] = (151645, 151643)
     device = torch.device('cuda:0')
 
