@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from safetensors.torch import load_file, save_file
 from typing import Optional
+from transformers.feature_extraction_utils import BatchFeature
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel, Qwen3VLTextRotaryEmbedding, Qwen3VLTextRMSNorm
 
 from flash_attn import flash_attn_func, flash_attn_with_kvcache
@@ -11,7 +12,7 @@ from flash_attn import flash_attn_func, flash_attn_with_kvcache
 from flexcachegen.config import Config
 from flexcachegen.kvcache import KVCacheManager
 from flexcachegen.models.qwen3vl_util import get_video_features, get_placeholder_mask, get_rope_index
-from flexcachegen.utils import print_duration
+from flexcachegen.utils import VideoInfo, print_duration
 
 
 
@@ -106,20 +107,31 @@ class Qwen3VLTextAttention(nn.Module):
         k = k.transpose(1, 2).contiguous()
 
         if is_prefill:
-            # store kv to kv cache pool
-            kv_cache_manager.gpu_buffer[self.layer_idx].lazy_initialization(k,v)
-            kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
+            cache_layer = kv_cache_manager.gpu_buffer[self.layer_idx]
+            cache_layer.lazy_initialization(k,v)
+
+            if self.config.sparsity_strategy == 'before-prefill':
+                cache_layer.apply_video_pruning()
 
             # attention computation
-            # shape: (batch, seq, num_attention_heads, head_dim)
-            attn_output = flash_attn_func(q, k, v, causal=True)
+            attn_output = flash_attn_func(
+                q=q,
+                k=cache_layer.get_keys(),
+                v=cache_layer.get_values(),
+                causal=True,
+            )
+
+            if self.config.sparsity_strategy == 'after-prefill':
+                cache_layer.apply_video_pruning()
+
+            # store kv to kv cache pool
+            # kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
         
         else: # decoding stage
-            # retrieve kv to GPU from kv cache pool
-            cache_layer = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
+            cache_layer = kv_cache_manager.gpu_buffer[self.layer_idx]
 
             # attention computation
-            # flash_attn_with_kvcache() will update kv cache inside
+            # Note: flash_attn_with_kvcache() will update kv cache inside
             attn_output = flash_attn_with_kvcache(
                 q=q,
                 k_cache=cache_layer.keys,
@@ -132,9 +144,9 @@ class Qwen3VLTextAttention(nn.Module):
             cache_layer.seq_len += 1
 
             # store kv to kv cache pool
-            kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
+            # kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
 
-        # shape: (batch, seq, hidden_size)
+        # (batch, seq, num_attention_heads, head_dim) -> (batch, seq, hidden_size)
         attn_output = attn_output.reshape(batch_size, seq_len, hidden_size)
         attn_output = self.o_proj(attn_output)
         
@@ -311,10 +323,48 @@ class Qwen3VLModel(nn.Module):
 
         del visual_state_dict, text_state_dict
         torch.cuda.empty_cache()
+
+
+    @print_duration
+    def get_video_info(self, inputs: BatchFeature):
+        '''
+        Qwen3-VL prompt format:
+        <|im_start|>user
+        <x.x seconds><|vision_start|><|video_pad|>...<|video_pad|><|vision_end|>...<x.x seconds><|vision_start|><|video_pad|>...<|video_pad|><|vision_end|>Please describe this video in detail.<|im_end|>
+        <|im_start|>assistant
+        '''
+        vision_start_token_id = 151652 # <|vision_start|>
+        vision_end_token_id = 151653 # <|vision_end|>
+        video_pad_token_id = 151656 # <|video_pad|>
+
+        T_len, H_len, W_len = inputs.video_grid_thw[0].tolist()
+        spatial_merge_size = self.config.spatial_merge_size
+        H_len = H_len // spatial_merge_size
+        W_len = W_len // spatial_merge_size
+
+        video_token_start_idx = (inputs.input_ids[0, :] == vision_start_token_id).nonzero().squeeze().tolist()
+        video_token_end_idx = (inputs.input_ids[0, :] == vision_end_token_id).nonzero().squeeze().tolist()
+
+        index_ranges = [] # <|vision_start|>, <|vision_end|> is not included
+        for t in range(T_len):
+            start_idx = video_token_start_idx[t] + 1
+            end_idx = video_token_end_idx[t] - 1
+            index_ranges.append( (start_idx, end_idx) )
+        # index_ranges = [(video_token_start_idx[0], video_token_end_idx[-1])]
+
+        # print(f'{T_len=}, {H_len=}, {W_len=}')
+        # print(f'{index_ranges=}')
+
+        return VideoInfo(
+            T_len=T_len,
+            H_len=H_len,
+            W_len=W_len,
+            index_ranges=index_ranges,
+        )
         
 
     @print_duration
-    def encoding(self, inputs):
+    def encoding(self, inputs: BatchFeature):
 
         # get inputs
         input_ids = inputs["input_ids"].to(self.config.device)

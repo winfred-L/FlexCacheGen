@@ -139,8 +139,10 @@ class VLMEngine:
         inputs = inputs.to(self.config.device)
         prompt_len = inputs["input_ids"].shape[1]
         # print_cuda_memory_usage(self.config.device)
-
         print(f"{inputs.input_ids.shape=}")
+
+        # 1.5. set video info to kv cache manager, used for kv sparsity eviction strategy
+        self.kv_cache_manager.set_video_info(self.model.get_video_info(inputs))
         
         # 2. encoding stage
         hidden_states = self.model.encoding(inputs)

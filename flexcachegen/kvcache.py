@@ -1,5 +1,6 @@
 import torch
 from flexcachegen.config import Config
+from flexcachegen.utils import VideoInfo
 # from transformers.cache_utils import DynamicLayer
 
 class CacheLayer:
@@ -9,11 +10,18 @@ class CacheLayer:
     The max capacity is allocated after prefill and limited by `config.max_new_tokens`.
     New decoding KV is updated in flash-attn kernel `flash_attn_with_kvcache`, only `seq_len` needs manually controlled.
     """
+
+    keys: torch.Tensor
+    values: torch.Tensor
+    seq_len: int
+    max_seq_len: int
+    video_info: VideoInfo
     
-    def __init__(self, max_new_tokens):
+    def __init__(self, config: Config):
+        self.config = config
         self.seq_len = 0
         self.max_seq_len = 0
-        self.max_new_tokens = max_new_tokens
+        self.max_new_tokens = self.config.max_new_tokens
 
     def lazy_initialization(
         self,
@@ -39,15 +47,42 @@ class CacheLayer:
         self.keys[:, :seq_len].copy_(key_states)
         self.values[:, :seq_len].copy_(value_states)
 
-        
+    def get_keys(self):
+        return self.keys[:, :self.seq_len]
+    
+    def get_values(self):
+        return self.values[:, :self.seq_len]
+    
+    def apply_video_pruning(self):
+        """
+        Evict video token kv inplace.
+        Note: `max_seq_len` remains unchanged.
+        """
+        keep_mask = torch.ones(self.seq_len, dtype=torch.bool, device=self.keys.device)
+        for start, end in self.video_info.index_ranges:
+            assert start >= 0 and start < self.seq_len, 'video_info.index_ranges.start out of range'
+            assert end >= 0 and end < self.seq_len, 'video_info.index_ranges.end out of range'
+            keep_mask[start:end+1] = False
+
+        keep_indices = torch.where(keep_mask)[0]
+        new_seq_len = keep_indices.shape[0]
+
+        compact_keys = self.keys[:, keep_indices]
+        compact_values = self.values[:, keep_indices]
+
+        self.keys[:, :new_seq_len].copy_(compact_keys)
+        self.values[:, :new_seq_len].copy_(compact_values)
+
+        self.seq_len = new_seq_len
+
     
 
 class KVCacheManager:
     def __init__(self, config: Config):
         self.config = config
         self.num_hidden_layers = config.hf_config.text_config.num_hidden_layers
-
-        self.gpu_buffer = [CacheLayer(self.config.max_new_tokens) for _ in range(self.num_hidden_layers)]
+        
+        self.gpu_buffer = [CacheLayer(self.config) for _ in range(self.num_hidden_layers)]
     
     def offload_layer_to_cpu(self, layer_idx):
         # TODO
@@ -58,8 +93,11 @@ class KVCacheManager:
         return self.gpu_buffer[layer_idx]
 
     def clear(self):
-        self.gpu_buffer = [CacheLayer(self.config.max_new_tokens) for _ in range(self.num_hidden_layers)]
+        self.gpu_buffer = [CacheLayer(self.config) for _ in range(self.num_hidden_layers)]
 
+    def set_video_info(self, video_info: VideoInfo):
+        for layer_idx in range(self.num_hidden_layers):
+            self.gpu_buffer[layer_idx].video_info = video_info
 
 
 class BasicKVCacheManager(KVCacheManager):

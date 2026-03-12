@@ -1,6 +1,17 @@
 import torch
 from time import perf_counter
 from functools import wraps
+from dataclasses import dataclass
+
+@dataclass
+class VideoInfo:
+    T_len: int
+    H_len: int
+    W_len: int
+    index_ranges: list[tuple[int, int]]
+        # list of (start_idx, end_idx) of input video token, aka <|video_pad|>, end_idx is included
+
+
 
 def get_tensor_size(tensor: torch.Tensor) -> str:
     num_elements = tensor.nelement()

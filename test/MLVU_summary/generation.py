@@ -16,6 +16,8 @@ def main():
     with open(json_file_path, 'r', encoding='utf-8') as f:
         dataset = json.load(f)
 
+    # dataset = dataset[:3] # for test
+
     # generation
     results = []
     for sample in tqdm(dataset):
@@ -34,10 +36,12 @@ def main():
     
     # save result to file
     output_path = '/data1/lyc/flexcachegen_outputs'
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    os.makedirs(output_path, exist_ok=True)
     model_type = 'qwen3vl-8b'
     dataset_type = 'mlvu-summary'
-    result_file_path = os.path.join(output_path, f'pred_{model_type}_{dataset_type}_{timestamp}.json')
+    sparsity_strategy = vlm.config.sparsity_strategy
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    result_file_path = os.path.join(output_path, f'pred_{model_type}_{dataset_type}_{sparsity_strategy}_{timestamp}.json')
     with open(result_file_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=4, ensure_ascii=False)
 
