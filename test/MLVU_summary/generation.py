@@ -34,11 +34,10 @@ def main():
     
     # save result to file
     output_path = '/data1/lyc/flexcachegen_outputs'
-    # timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # model_type = 'qwen3vl-8b'
-    # dataset_type = 'MLVU_summary'
-    # result_file_path = os.path.join(output_path, f'{model_type}-{dataset_type}-{timestamp}.json')
-    result_file_path = os.path.join(output_path, f'pred_summary_all.json')
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    model_type = 'qwen3vl-8b'
+    dataset_type = 'mlvu-summary'
+    result_file_path = os.path.join(output_path, f'pred_{model_type}_{dataset_type}_{timestamp}.json')
     with open(result_file_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=4, ensure_ascii=False)
 
@@ -50,7 +49,6 @@ if __name__ == "__main__":
 
 
 '''
-dataset json:
-
+dataset json example:
 {'video': '217.mp4', 'duration': 480.0, 'question': 'Please summarize this video, including its main content.', 'answer': 'The video starts with waves lapping against the rocks, creating a spray. Then, a boat appears with two men on board, one with a hat and the other without. The man without a hat holds a camera, seemingly focusing on two whales. The hatless man changes into a diving suit and dives underwater for a closer shot of the whales. The video then uses animation techniques to help us understand more about the whales. The video switches between the characters and the whales, but primarily describes the human activity of filming the whales.', 'question_type': 'summary'}
 '''
