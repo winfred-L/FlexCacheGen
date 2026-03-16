@@ -111,7 +111,7 @@ class Qwen3VLTextAttention(nn.Module):
             cache_layer.lazy_initialization(k,v)
 
             if self.config.sparsity_strategy == 'before-prefill':
-                cache_layer.apply_video_pruning()
+                kv_cache_manager.apply_pruning_for_layer(self.layer_idx)
 
             # attention computation
             attn_output = flash_attn_func(
@@ -122,7 +122,7 @@ class Qwen3VLTextAttention(nn.Module):
             )
 
             if self.config.sparsity_strategy == 'after-prefill':
-                cache_layer.apply_video_pruning()
+                kv_cache_manager.apply_pruning_for_layer(self.layer_idx)
 
             # store kv to kv cache pool
             # kv_cache_manager.offload_layer_to_cpu(self.layer_idx)

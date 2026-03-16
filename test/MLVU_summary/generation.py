@@ -40,8 +40,9 @@ def main():
     model_type = 'qwen3vl-8b'
     dataset_type = 'mlvu-summary'
     sparsity_strategy = vlm.config.sparsity_strategy
+    sparsity_threshold = vlm.config.sparsity_threshold
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    result_file_path = os.path.join(output_path, f'pred_{model_type}_{dataset_type}_{sparsity_strategy}_{timestamp}.json')
+    result_file_path = os.path.join(output_path, f'pred_{model_type}_{dataset_type}_{sparsity_strategy}_{sparsity_threshold}_{timestamp}.json')
     with open(result_file_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=4, ensure_ascii=False)
 
