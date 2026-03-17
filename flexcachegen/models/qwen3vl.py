@@ -107,44 +107,43 @@ class Qwen3VLTextAttention(nn.Module):
         k = k.transpose(1, 2).contiguous()
 
         if is_prefill:
-            cache_layer = kv_cache_manager.gpu_buffer[self.layer_idx]
-            cache_layer.lazy_initialization(k,v)
-
+            # Prune BEFORE attention if strategy is 'before-prefill'
             if self.config.sparsity_strategy == 'before-prefill':
-                kv_cache_manager.apply_pruning_for_layer(self.layer_idx)
+                kv_cache_manager.apply_pruning_for_kv(self.layer_idx, k, v)
 
-            # attention computation
+            # attention computation using local GPU k, v tensors
             attn_output = flash_attn_func(
                 q=q,
-                k=cache_layer.get_keys(),
-                v=cache_layer.get_values(),
+                k=k,
+                v=v,
                 causal=True,
             )
 
+            # Prune AFTER attention if strategy is 'after-prefill'
             if self.config.sparsity_strategy == 'after-prefill':
-                kv_cache_manager.apply_pruning_for_layer(self.layer_idx)
+                kv_cache_manager.apply_pruning_for_kv(self.layer_idx, k, v)
 
-            # store kv to kv cache pool
-            kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
+            # Save to cache (offload to CPU if offload_kv_to_cpu is True)
+            kv_cache_manager.save_prefill_kv(self.layer_idx, k, v)
 
         else: # decoding stage
-            cache_layer = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
+            cache_seqlens = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
+            gpu_keys, gpu_values = kv_cache_manager.get_shared_buffer()
 
             # attention computation
             # Note: flash_attn_with_kvcache() will update kv cache inside
             attn_output = flash_attn_with_kvcache(
                 q=q,
-                k_cache=cache_layer.keys,
-                v_cache=cache_layer.values,
+                k_cache=gpu_keys,
+                v_cache=gpu_values,
                 k=k,
                 v=v,
-                cache_seqlens=cache_layer.seq_len,
+                cache_seqlens=cache_seqlens,
                 causal=True,
             )
-            cache_layer.seq_len += 1
 
-            # store kv to kv cache pool
-            kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
+            # Update new token kv (offload to CPU if offload_kv_to_cpu is True)
+            kv_cache_manager.update_after_decode(self.layer_idx)
 
         # (batch, seq, num_attention_heads, head_dim) -> (batch, seq, hidden_size)
         attn_output = attn_output.reshape(batch_size, seq_len, hidden_size)

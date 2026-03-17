@@ -27,8 +27,8 @@ class Config:
     max_new_tokens: int = 1024
 
     # sparsity settings
-    sparsity_strategy: str = 'after-prefill' # ['none', 'before-prefill', 'after-prefill']
-    sparsity_threshold: str = '0.2'
+    sparsity_strategy: str = 'none' # ['none', 'before-prefill', 'after-prefill']
+    sparsity_threshold: str = '0.8'
     pruning_heads: dict[int, list[int]] | None = None # {layer_idx: [head_indices]}
         # when sparsity_strategy is not 'none', pruning_heads is 'none', prune all video kv inplace.
 
@@ -47,9 +47,11 @@ class Config:
 
         if self.sparsity_strategy != 'none':
             self.pruning_heads = pruning_heads_list[self.sparsity_threshold]
-            print(f"Pruning heads with threshold = {self.sparsity_threshold}")
 
-    def print_config(self):
+        self.print_settings()
+            
+
+    def print_settings(self):
         print("==== Configurations ====")
         print("Model path:", self.model_path)
         print("Device:", self.device)
