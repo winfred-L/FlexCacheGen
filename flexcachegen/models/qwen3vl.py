@@ -125,10 +125,10 @@ class Qwen3VLTextAttention(nn.Module):
                 kv_cache_manager.apply_pruning_for_layer(self.layer_idx)
 
             # store kv to kv cache pool
-            # kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
-        
+            kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
+
         else: # decoding stage
-            cache_layer = kv_cache_manager.gpu_buffer[self.layer_idx]
+            cache_layer = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
 
             # attention computation
             # Note: flash_attn_with_kvcache() will update kv cache inside
@@ -144,7 +144,7 @@ class Qwen3VLTextAttention(nn.Module):
             cache_layer.seq_len += 1
 
             # store kv to kv cache pool
-            # kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
+            kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
 
         # (batch, seq, num_attention_heads, head_dim) -> (batch, seq, hidden_size)
         attn_output = attn_output.reshape(batch_size, seq_len, hidden_size)

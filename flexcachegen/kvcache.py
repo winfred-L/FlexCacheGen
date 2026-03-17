@@ -26,6 +26,10 @@ class CacheLayer:
         self.max_seq_len = 0
         self.max_new_tokens = self.config.max_new_tokens
 
+        # CPU storage for offloaded KV (pinned memory, allocated on first offload)
+        self.cpu_keys: torch.Tensor | None = None
+        self.cpu_values: torch.Tensor | None = None
+
     def lazy_initialization(
         self,
         key_states: torch.Tensor,
@@ -58,7 +62,7 @@ class CacheLayer:
 
     def apply_video_pruning(self):
         """
-        Evict video token kv inplace.
+        Evict video token kv inplace. Do actual compaction (remove token positions), since all heads are pruned.
         Note: `max_seq_len` remains unchanged.
         """
         keep_mask = torch.ones(self.seq_len, dtype=torch.bool, device=self.keys.device)
@@ -89,6 +93,51 @@ class CacheLayer:
             self.keys[:, start:end+1, head_indices, :] = 0
             self.values[:, start:end+1, head_indices, :] = 0
 
+    def offload_to_cpu(self):
+        """
+        Offload KV cache from GPU to CPU pinned memory, then free GPU tensors.
+        Prefill (first call): allocate max_seq_len pinned buffer, copy all valid data.
+        Decode (subsequent calls): only copy the newly appended token.
+        """
+        seq_len = self.seq_len
+
+        if self.cpu_keys is None:
+            # Prefill: allocate full pinned CPU buffer
+            batch, _, heads, dim = self.keys.shape
+            self.cpu_keys = torch.empty(
+                (batch, self.max_seq_len, heads, dim),
+                dtype=self.keys.dtype, device='cpu',
+            ).pin_memory()
+            self.cpu_values = torch.empty(
+                (batch, self.max_seq_len, heads, dim),
+                dtype=self.values.dtype, device='cpu',
+            ).pin_memory()
+            self.cpu_keys[:, :seq_len].copy_(self.keys[:, :seq_len], non_blocking=True)
+            self.cpu_values[:, :seq_len].copy_(self.values[:, :seq_len], non_blocking=True)
+        else:
+            # Decode: only copy the newly appended token
+            pos = seq_len - 1
+            self.cpu_keys[:, pos:pos + 1].copy_(self.keys[:, pos:pos + 1], non_blocking=True)
+            self.cpu_values[:, pos:pos + 1].copy_(self.values[:, pos:pos + 1], non_blocking=True)
+
+        torch.cuda.current_stream().synchronize()
+
+        # Free GPU tensors (will be replaced by shared buffer on next load)
+        self.keys = None
+        self.values = None
+
+    def load_to_gpu(self, gpu_keys: torch.Tensor, gpu_values: torch.Tensor):
+        """Load KV cache from CPU pinned memory into provided GPU buffers.
+        The caller (KVCacheManager) provides pre-allocated shared GPU buffers.
+        """
+        seq_len = self.seq_len
+        gpu_keys[:, :seq_len].copy_(self.cpu_keys[:, :seq_len], non_blocking=True)
+        gpu_values[:, :seq_len].copy_(self.cpu_values[:, :seq_len], non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+
+        self.keys = gpu_keys
+        self.values = gpu_values
+
 
 
 class KVCacheManager:
@@ -99,16 +148,41 @@ class KVCacheManager:
 
         self.gpu_buffer = [CacheLayer(self.config, layer_idx) for layer_idx in range(self.num_hidden_layers)]
 
-    def offload_layer_to_cpu(self, layer_idx):
-        # TODO
-        pass
+        # Shared single-layer GPU buffer, reused across layers during decode (lazily allocated)
+        self._shared_gpu_keys: torch.Tensor | None = None
+        self._shared_gpu_values: torch.Tensor | None = None
 
-    def load_layer_to_gpu(self, layer_idx):
-        # do nothing now, only return specific layer's cache
-        return self.gpu_buffer[layer_idx]
+    def _ensure_shared_gpu_buffer(self, cache_layer: CacheLayer):
+        """Lazily allocate a single-layer-sized GPU buffer for decode-time reuse."""
+        if self._shared_gpu_keys is not None:
+            return
+        batch, _, heads, dim = cache_layer.cpu_keys.shape
+        device, dtype = self.config.device, cache_layer.cpu_keys.dtype
+        self._shared_gpu_keys = torch.empty(
+            (batch, cache_layer.max_seq_len, heads, dim), device=device, dtype=dtype,
+        )
+        self._shared_gpu_values = torch.empty(
+            (batch, cache_layer.max_seq_len, heads, dim), device=device, dtype=dtype,
+        )
+
+    def offload_layer_to_cpu(self, layer_idx: int):
+        if not self.config.offload_kv_to_cpu:
+            return
+        self.gpu_buffer[layer_idx].offload_to_cpu()
+
+    def load_layer_to_gpu(self, layer_idx: int) -> CacheLayer:
+        cache_layer = self.gpu_buffer[layer_idx]
+        if not self.config.offload_kv_to_cpu or cache_layer.cpu_keys is None:
+            return cache_layer
+
+        self._ensure_shared_gpu_buffer(cache_layer)
+        cache_layer.load_to_gpu(self._shared_gpu_keys, self._shared_gpu_values)
+        return cache_layer
 
     def clear(self):
         self.gpu_buffer = [CacheLayer(self.config, layer_idx) for layer_idx in range(self.num_hidden_layers)]
+        self._shared_gpu_keys = None
+        self._shared_gpu_values = None
 
     def set_video_info(self, video_info: VideoInfo):
         for layer_idx in range(self.num_hidden_layers):

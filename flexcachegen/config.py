@@ -27,9 +27,13 @@ class Config:
     max_new_tokens: int = 1024
 
     # sparsity settings
-    sparsity_strategy: str = 'before-prefill' # ['none', 'before-prefill', 'after-prefill']
-    sparsity_threshold: str = '1.0'
-    pruning_heads: dict[int, list[int]] | None = None 
+    sparsity_strategy: str = 'after-prefill' # ['none', 'before-prefill', 'after-prefill']
+    sparsity_threshold: str = '0.2'
+    pruning_heads: dict[int, list[int]] | None = None # {layer_idx: [head_indices]}
+        # when sparsity_strategy is not 'none', pruning_heads is 'none', prune all video kv inplace.
+
+    # offloading settings
+    offload_kv_to_cpu: bool = True
 
 
     def __init__(self, model_path: str, **kwargs):
@@ -41,7 +45,20 @@ class Config:
         self.spatial_merge_size = 2
         self.eos_token_id = (151645, 151643)
 
-        self.pruning_heads = pruning_heads_list[self.sparsity_threshold]
-        print(f"Pruning heads for threshold {self.sparsity_threshold}: {self.pruning_heads}")
-            # {layer_idx: [head_indices]}, None = prune all layers/heads
+        if self.sparsity_strategy != 'none':
+            self.pruning_heads = pruning_heads_list[self.sparsity_threshold]
+            print(f"Pruning heads with threshold = {self.sparsity_threshold}")
+
+    def print_config(self):
+        print("==== Configurations ====")
+        print("Model path:", self.model_path)
+        print("Device:", self.device)
+        print("Temperature:", self.temperature)
+        print("Max new tokens:", self.max_new_tokens)
+        print("Sparsity strategy:", self.sparsity_strategy)
+        print("Sparsity threshold:", self.sparsity_threshold)
+        print("Pruning heads:", self.pruning_heads)
+        print("Offload KV to CPU:", self.offload_kv_to_cpu)
+        print("========================")
+            
 
