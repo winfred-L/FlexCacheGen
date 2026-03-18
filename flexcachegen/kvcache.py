@@ -211,27 +211,33 @@ class CacheLayer:
         P = len(self.pruned_head_indices)
         T = self.text_len
 
-        # Slice views once
-        sa_k = staging_active_keys[:, :S, :A]
-        sa_v = staging_active_values[:, :S, :A]
-        tsm = text_seq_map[:S]
+        # CPU buffers are [B, max_S, A, D] with per-layer A — contiguous.
+        # Staging buffers are [B, max_S, max_A, D] — slice [:, :S, :A] is non-contiguous when A < max_A.
+        # Fix: DMA into a contiguous view by reshaping the flat staging memory.
+        B = staging_active_keys.shape[0]
+        D = staging_active_keys.shape[3]
 
-        # DMA all 4 compact buffers (pinned→GPU, all non_blocking on default stream)
-        sa_k.copy_(self.cpu_keys_active[:, :S, :A], non_blocking=True)
-        sa_v.copy_(self.cpu_values_active[:, :S, :A], non_blocking=True)
+        # Use contiguous flat region of staging buffer for active heads
+        sa_k = staging_active_keys.reshape(B, -1)[:, :S * A * D].reshape(B, S, A, D)
+        sa_v = staging_active_values.reshape(B, -1)[:, :S * A * D].reshape(B, S, A, D)
+
+        # DMA contiguous pinned CPU → contiguous GPU staging
+        sa_k.copy_(self.cpu_keys_active[:, :S], non_blocking=True)
+        sa_v.copy_(self.cpu_values_active[:, :S], non_blocking=True)
 
         if P > 0 and T > 0:
-            sp_k = staging_pruned_keys[:, :T, :P]
-            sp_v = staging_pruned_values[:, :T, :P]
-            sp_k.copy_(self.cpu_keys_pruned_text[:, :T, :P], non_blocking=True)
-            sp_v.copy_(self.cpu_values_pruned_text[:, :T, :P], non_blocking=True)
+            sp_k = staging_pruned_keys.reshape(B, -1)[:, :T * P * D].reshape(B, T, P, D)
+            sp_v = staging_pruned_values.reshape(B, -1)[:, :T * P * D].reshape(B, T, P, D)
+            sp_k.copy_(self.cpu_keys_pruned_text[:, :T], non_blocking=True)
+            sp_v.copy_(self.cpu_values_pruned_text[:, :T], non_blocking=True)
         else:
             sp_k = staging_pruned_keys[:, :1, :max(P, 1)]
             sp_v = staging_pruned_values[:, :1, :max(P, 1)]
 
         torch.cuda.current_stream().synchronize()
 
-        # Triton scatter into full layout
+        # Triton scatter into full layout (strides passed through, handles any layout)
+        tsm = text_seq_map[:S]
         sparse_scatter(sa_k, sp_k, gpu_keys[:, :S], head_source, head_compact_idx, tsm)
         sparse_scatter(sa_v, sp_v, gpu_values[:, :S], head_source, head_compact_idx, tsm)
 

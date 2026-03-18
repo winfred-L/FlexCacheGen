@@ -14,14 +14,12 @@ def _sparse_scatter_kernel(
     head_source_ptr,      # [H] — 0=active, 1=pruned
     head_compact_idx_ptr, # [H] — index within active or pruned buffer
     text_seq_map_ptr,     # [S] — seq pos → text buffer index (-1 for video)
-    # Dimensions
-    B: tl.constexpr,
-    S: tl.constexpr,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    A: tl.constexpr,      # number of active heads
-    P: tl.constexpr,      # number of pruned heads
-    T: tl.constexpr,      # number of text positions
+    # Dimensions — runtime parameters (NOT constexpr to avoid recompilation)
+    S,
+    H,
+    A,
+    P,
+    T,
     # Strides for compact_active [B, S, A, D]
     stride_ca_b, stride_ca_s, stride_ca_a, stride_ca_d,
     # Strides for compact_pruned [B, T, P, D]
@@ -44,7 +42,7 @@ def _sparse_scatter_kernel(
     # Output offset base
     out_offset = b * stride_f_b + s * stride_f_s + h * stride_f_h
     d_range = tl.arange(0, BLOCK_D)
-    d_mask = d_range < D
+    d_mask = d_range < BLOCK_D
 
     if is_pruned == 0:
         # Active head: read from compact_active[b, s, compact_idx, :]
@@ -81,7 +79,8 @@ def sparse_scatter(
     P = compact_pruned.shape[2] if compact_pruned.numel() > 0 else 0
     T = compact_pruned.shape[1] if compact_pruned.numel() > 0 else 0
 
-    # Round D up to next power of 2 for BLOCK_D
+    # D is always 128 for this model, BLOCK_D=128 is the only constexpr
+    # so only ONE kernel compilation ever happens
     BLOCK_D = triton.next_power_of_2(D)
 
     grid = (B * S * H,)
@@ -89,7 +88,7 @@ def sparse_scatter(
     _sparse_scatter_kernel[grid](
         compact_active, compact_pruned, full,
         head_source, head_compact_idx, text_seq_map,
-        B, S, H, D, A, P, T,
+        S, H, A, P, T,
         # compact_active strides
         compact_active.stride(0), compact_active.stride(1),
         compact_active.stride(2), compact_active.stride(3),
