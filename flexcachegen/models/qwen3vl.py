@@ -129,6 +129,7 @@ class Qwen3VLTextAttention(nn.Module):
         else: # decoding stage
             cache_seqlens = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
             gpu_keys, gpu_values = kv_cache_manager.get_shared_buffer()
+            block_table = kv_cache_manager.get_block_table()  # None for non-paged
 
             # attention computation
             # Note: flash_attn_with_kvcache() will update kv cache inside
@@ -139,6 +140,7 @@ class Qwen3VLTextAttention(nn.Module):
                 k=k,
                 v=v,
                 cache_seqlens=cache_seqlens,
+                block_table=block_table,
                 causal=True,
             )
 

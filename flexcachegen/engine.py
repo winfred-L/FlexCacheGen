@@ -6,7 +6,7 @@ from transformers import AutoProcessor
 from qwen_vl_utils import process_vision_info
 
 from flexcachegen.config import Config
-from flexcachegen.kvcache import KVCacheManager
+from flexcachegen.kvcache import KVCacheManager, PagedKVCacheManager
 from flexcachegen.models.qwen3vl import Qwen3VLModel
 from flexcachegen.utils import get_tensor_size, print_cuda_memory_usage, print_duration
 
@@ -24,7 +24,10 @@ class VLMEngine:
         # self.config = Config(model_path, **config_kwargs)
         self.config = Config(model_path)
         # kv cache manager
-        self.kv_cache_manager = KVCacheManager(self.config)
+        if self.config.paged_kv:
+            self.kv_cache_manager = PagedKVCacheManager(self.config)
+        else:
+            self.kv_cache_manager = KVCacheManager(self.config)
         # model
         self.model = Qwen3VLModel(self.config, self.kv_cache_manager).to(self.config.device)
         self.processor = AutoProcessor.from_pretrained(self.config.model_path, use_fast=True)
