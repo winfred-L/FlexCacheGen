@@ -50,7 +50,7 @@ class VLMEngine:
                         # "min_pixels": 4 * 32 * 32,
                         # "max_pixels": 640 * 32 * 32,
                         # limit the total number of tokens in the video
-                        "total_pixels": 64 * 1024 * 32 * 32, # 64k tokens
+                        "total_pixels": 100 * 1024 * 32 * 32, # 64k tokens
                         # accept either `fps` or `nframes`
                         # "fps": 2.0,
                         # "nframes": 32, #2048,

@@ -27,8 +27,8 @@ class Config:
     max_new_tokens: int = 1024
 
     # sparsity settings
-    sparsity_strategy: str = 'none' # ['none', 'before-prefill', 'after-prefill']
-    sparsity_threshold: str = '0.8'
+    sparsity_strategy: str = 'after-prefill' # ['none', 'before-prefill', 'after-prefill']
+    sparsity_threshold: str = '0.9'
     pruning_heads: dict[int, list[int]] | None = None # {layer_idx: [head_indices]}
         # when sparsity_strategy is not 'none', pruning_heads is 'none', prune all video kv inplace.
 
@@ -58,8 +58,9 @@ class Config:
         print("Temperature:", self.temperature)
         print("Max new tokens:", self.max_new_tokens)
         print("Sparsity strategy:", self.sparsity_strategy)
-        print("Sparsity threshold:", self.sparsity_threshold)
-        print("Pruning heads:", self.pruning_heads)
+        if self.sparsity_strategy != 'none':
+            print("Sparsity threshold:", self.sparsity_threshold)
+            print("Pruning heads:", self.pruning_heads)
         print("Offload KV to CPU:", self.offload_kv_to_cpu)
         print("========================")
             
