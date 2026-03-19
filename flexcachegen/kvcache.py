@@ -632,8 +632,15 @@ class PagedKVCacheManager:
         # CPU staging for decode offload (sparse path)
         self._cpu_token_buf: torch.Tensor | None = None  # [1, 1, H, D]
 
+        # Block-level skip: layer_idx → set of block indices to skip during GPU loading
+        self._skipped_blocks: dict[int, set[int]] = {}
+
     def set_video_info(self, video_info: VideoInfo):
         self._video_info = video_info
+
+    def set_skipped_blocks(self, layer_idx: int, block_ids: set[int]):
+        """Set which blocks to skip for a given layer during GPU loading."""
+        self._skipped_blocks[layer_idx] = block_ids
 
     def apply_pruning_for_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply video token pruning on GPU k, v tensors (zero out specified heads at video positions).
@@ -879,9 +886,20 @@ class PagedKVCacheManager:
             self._load_layer_sparse(layer_idx)
         else:
             num_blocks = self._num_blocks_used
-            self._gpu_k_pool[:num_blocks].copy_(self._cpu_k_blocks[layer_idx][:num_blocks], non_blocking=True)
-            self._gpu_v_pool[:num_blocks].copy_(self._cpu_v_blocks[layer_idx][:num_blocks], non_blocking=True)
-            torch.cuda.current_stream().synchronize()
+            skipped = self._skipped_blocks.get(layer_idx)
+            if skipped:
+                for i in range(num_blocks):
+                    if i in skipped:
+                        self._gpu_k_pool[i].zero_()
+                        self._gpu_v_pool[i].zero_()
+                    else:
+                        self._gpu_k_pool[i].copy_(self._cpu_k_blocks[layer_idx][i], non_blocking=True)
+                        self._gpu_v_pool[i].copy_(self._cpu_v_blocks[layer_idx][i], non_blocking=True)
+                torch.cuda.current_stream().synchronize()
+            else:
+                self._gpu_k_pool[:num_blocks].copy_(self._cpu_k_blocks[layer_idx][:num_blocks], non_blocking=True)
+                self._gpu_v_pool[:num_blocks].copy_(self._cpu_v_blocks[layer_idx][:num_blocks], non_blocking=True)
+                torch.cuda.current_stream().synchronize()
 
         return torch.tensor([self._seq_len], dtype=torch.int32, device=self.device)
 
@@ -923,6 +941,14 @@ class PagedKVCacheManager:
         tsm = self._text_seq_map[:S]
         sparse_scatter(sa_k, sp_k, full_k[:, :S], self._layer_head_source[layer_idx], self._layer_head_compact_idx[layer_idx], tsm)
         sparse_scatter(sa_v, sp_v, full_v[:, :S], self._layer_head_source[layer_idx], self._layer_head_compact_idx[layer_idx], tsm)
+
+        # Zero out skipped blocks after scatter
+        skipped = self._skipped_blocks.get(layer_idx)
+        if skipped:
+            for bid in skipped:
+                if bid < num_blocks:
+                    self._gpu_k_pool[bid].zero_()
+                    self._gpu_v_pool[bid].zero_()
 
     def get_shared_buffer(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return GPU block pool tensors [max_blocks, block_size, H, D]."""
@@ -1042,3 +1068,4 @@ class PagedKVCacheManager:
         self._layer_head_compact_idx.clear()
         self._text_seq_map = None
         self._cpu_token_buf = None
+        self._skipped_blocks.clear()
