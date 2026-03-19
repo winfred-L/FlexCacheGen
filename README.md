@@ -4,26 +4,26 @@ A VLM generation framework with a flexible KV cache manager.
 
 ## Introduction
 
-Combine [FlexGen](https://github.com/FMInference/FlexLLMGen) and [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm), support latest VLM [Qwen3-VL](https://huggingface.co/collections/Qwen/qwen3-vl).
+Combine Offloading([FlexGen])(https://github.com/FMInference/FlexLLMGen) and PagedAttention([nano-vllm])(https://github.com/GeeeekExplorer/nano-vllm), support latest open-sourced VLM [Qwen3-VL](https://huggingface.co/collections/Qwen/qwen3-vl).
+
 
 Features:
-- Sparse attention implememt with sparse KV cache management.
-- KV cache offloading to memory after prefill stage, only load important part in decoding stage.
-- Overlapping attention computation with KV cache IO.
-- Paged KV cache management with head granularity, instead of token granularity.
+- Modality-aware KV cache sparsity, more efficient for multi-modal LLM.
+- Dynamic KV Selection without permanent eviction, better accuracy kept. (supported by multi-tier storage)
+- Paged KV cache management, less wasted memory.
+- Overlapping attention computation with KV cache IO, faster inference speed.
 
 
 ## Architechture
 
 ```
-Engine 负责计算流程控制
-ModelRunner 负责提供对应计算组件的接口
-KVCacheManager 负责 KV Cache 管理
-
+VLMEngine controls the generation process.
+Model(Qwen3VLModel) provides computing APIs for VLMEngine.
+KVCacheManager manages KV cache movement and sparsity.
 ```
 
 
-## Installation
+## Environment
 
 ```bash
 conda create -n flexcachegen python=3.12 -y
@@ -43,7 +43,7 @@ pip install torchcodec --index-url https://download.pytorch.org/whl/cu130
 pip install -e .
 ```
 
-## Download
+## Model and Dataset Download
 
 ```bash
 # models
@@ -53,5 +53,4 @@ modelscope download --model ZhipuAI/GLM-4.6V-Flash --local_dir /data/lyc/models/
 # MLVU summary
 modelscope download --dataset AI-ModelScope/MLVU --local_dir /data1/lyc/datasets/MLVU --include 'MLVU/json/9_summary/*'
 modelscope download --dataset AI-ModelScope/MLVU --local_dir /data1/lyc/datasets/MLVU --include 'MLVU/video/9_summary/*'
-
 ```
