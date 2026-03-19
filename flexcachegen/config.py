@@ -38,7 +38,7 @@ class Config:
     # paged attention settings
     paged_kv: bool = True  # when True, always offload kv to CPU
     block_size: int = 256  # flash_attn requires page_block_size to be a multiple of 256
-    block_topk: int | None = None  # if set, keep only top-k blocks per layer during decode
+    block_topk_ratio: float | None = None  # if set (0~1), keep this fraction of blocks per layer during decode
 
 
     def __init__(self, model_path: str, **kwargs):
@@ -70,7 +70,7 @@ class Config:
         print("Paged KV:", self.paged_kv)
         if self.paged_kv:
             print("Block size:", self.block_size)
-            print("Block topk:", self.block_topk)
+            print("Block topk ratio:", self.block_topk_ratio)
         print("========================")
             
 

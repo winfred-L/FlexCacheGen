@@ -641,7 +641,7 @@ class PagedKVCacheManager:
         # Block-level importance scoring (extreme K vectors)
         self._block_max_k: list[torch.Tensor | None] = [None] * self.num_hidden_layers  # [num_blocks, H_kv, D]
         self._block_min_k: list[torch.Tensor | None] = [None] * self.num_hidden_layers
-        self._block_topk: int | None = config.block_topk
+        self._block_topk_ratio: float | None = config.block_topk_ratio
         self._num_attention_heads: int = config.hf_config.text_config.num_attention_heads
 
     def set_video_info(self, video_info: VideoInfo):
@@ -677,12 +677,15 @@ class PagedKVCacheManager:
         """Compute per-block importance scores and set skipped blocks.
         q: [1, 1, H_q, D] on GPU (single decode token).
         """
-        if self._block_topk is None or self._block_topk >= self._num_blocks_used:
+        if self._block_topk_ratio is None:
             return
         if self._block_max_k[layer_idx] is None:
             return
 
         num_blocks = self._num_blocks_used
+        topk = max(1, int(math.ceil(num_blocks * self._block_topk_ratio)))
+        if topk >= num_blocks:
+            return
         H_kv = self.num_kv_heads
         D = self.head_dim
         num_q_per_kv = self._num_attention_heads // H_kv
@@ -710,7 +713,7 @@ class PagedKVCacheManager:
         # Always keep the last block (contains most recent tokens)
         block_scores[-1] = float('inf')
 
-        _, top_indices = block_scores.topk(min(self._block_topk, num_blocks))
+        _, top_indices = block_scores.topk(topk)
         skipped = set(range(num_blocks)) - set(top_indices.cpu().tolist())
         self.set_skipped_blocks(layer_idx, skipped)
 
@@ -750,7 +753,7 @@ class PagedKVCacheManager:
         else:
             self._save_prefill_dense(layer_idx, k, v)
 
-        if self._block_topk is not None:
+        if self._block_topk_ratio is not None:
             self._compute_extreme_k(layer_idx, k)
 
     def _save_prefill_dense(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
