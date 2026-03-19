@@ -1167,6 +1167,11 @@ class PagedKVCacheManager:
 
         if self._is_sparse.get(layer_idx, False):
             self._load_layer_sparse(layer_idx)
+            # Restore full block table (may have been overwritten by compact load on previous layer)
+            self._block_table_gpu = torch.tensor(
+                [self._block_table[:self._num_blocks_used]],
+                dtype=torch.int32, device=self.device,
+            )
             return torch.tensor([self._seq_len], dtype=torch.int32, device=self.device)
 
         # Dense path
