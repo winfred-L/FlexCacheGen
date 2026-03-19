@@ -561,6 +561,9 @@ class KVCacheManager:
         for layer_idx in range(self.num_hidden_layers):
             self._layers[layer_idx].video_info = video_info
 
+    def compute_block_importance(self, layer_idx: int, q: torch.Tensor):
+        pass
+
 
 class PagedKVCacheManager:
     """Paged KV cache manager for CPU offload with block-level granularity.
@@ -635,12 +638,81 @@ class PagedKVCacheManager:
         # Block-level skip: layer_idx → set of block indices to skip during GPU loading
         self._skipped_blocks: dict[int, set[int]] = {}
 
+        # Block-level importance scoring (extreme K vectors)
+        self._block_max_k: list[torch.Tensor | None] = [None] * self.num_hidden_layers  # [num_blocks, H_kv, D]
+        self._block_min_k: list[torch.Tensor | None] = [None] * self.num_hidden_layers
+        self._block_topk: int | None = config.block_topk
+        self._num_attention_heads: int = config.hf_config.text_config.num_attention_heads
+
     def set_video_info(self, video_info: VideoInfo):
         self._video_info = video_info
 
     def set_skipped_blocks(self, layer_idx: int, block_ids: set[int]):
         """Set which blocks to skip for a given layer during GPU loading."""
         self._skipped_blocks[layer_idx] = block_ids
+
+    def _compute_extreme_k(self, layer_idx: int, k: torch.Tensor):
+        """Compute per-block element-wise max and min of K vectors.
+        k: [1, S, H_kv, D] on GPU.
+        """
+        S = k.shape[1]
+        H = self.num_kv_heads
+        D = self.head_dim
+        num_blocks = math.ceil(S / self.block_size)
+
+        max_k = torch.empty(num_blocks, H, D, device=k.device, dtype=k.dtype)
+        min_k = torch.empty(num_blocks, H, D, device=k.device, dtype=k.dtype)
+
+        for i in range(num_blocks):
+            start = i * self.block_size
+            end = min(start + self.block_size, S)
+            block_k = k[0, start:end]  # [length, H_kv, D]
+            max_k[i] = block_k.max(dim=0).values
+            min_k[i] = block_k.min(dim=0).values
+
+        self._block_max_k[layer_idx] = max_k
+        self._block_min_k[layer_idx] = min_k
+
+    def compute_block_importance(self, layer_idx: int, q: torch.Tensor):
+        """Compute per-block importance scores and set skipped blocks.
+        q: [1, 1, H_q, D] on GPU (single decode token).
+        """
+        if self._block_topk is None or self._block_topk >= self._num_blocks_used:
+            return
+        if self._block_max_k[layer_idx] is None:
+            return
+
+        num_blocks = self._num_blocks_used
+        H_kv = self.num_kv_heads
+        D = self.head_dim
+        num_q_per_kv = self._num_attention_heads // H_kv
+
+        # q: [1, 1, H_q, D] → [H_kv, G, D]
+        q_grouped = q[0, 0].view(H_kv, num_q_per_kv, D)
+
+        max_k = self._block_max_k[layer_idx][:num_blocks]  # [num_blocks, H_kv, D]
+        min_k = self._block_min_k[layer_idx][:num_blocks]
+
+        # Expand for broadcasting: q [1, H_kv, G, D] × K [num_blocks, H_kv, 1, D]
+        q_exp = q_grouped.unsqueeze(0)          # [1, H_kv, G, D]
+        max_k_exp = max_k.unsqueeze(2)          # [num_blocks, H_kv, 1, D]
+        min_k_exp = min_k.unsqueeze(2)          # [num_blocks, H_kv, 1, D]
+
+        # Upper bound: for each element, max(q*max_k, q*min_k)
+        upper = torch.where(
+            q_exp >= 0,
+            q_exp * max_k_exp,
+            q_exp * min_k_exp,
+        )
+        scores = upper.sum(dim=-1)              # [num_blocks, H_kv, G]
+        block_scores = scores.amax(dim=(1, 2))  # [num_blocks]
+
+        # Always keep the last block (contains most recent tokens)
+        block_scores[-1] = float('inf')
+
+        _, top_indices = block_scores.topk(min(self._block_topk, num_blocks))
+        skipped = set(range(num_blocks)) - set(top_indices.cpu().tolist())
+        self.set_skipped_blocks(layer_idx, skipped)
 
     def apply_pruning_for_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply video token pruning on GPU k, v tensors (zero out specified heads at video positions).
@@ -677,6 +749,9 @@ class PagedKVCacheManager:
             self._save_prefill_sparse(layer_idx, k, v)
         else:
             self._save_prefill_dense(layer_idx, k, v)
+
+        if self._block_topk is not None:
+            self._compute_extreme_k(layer_idx, k)
 
     def _save_prefill_dense(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
         """Dense path: store prefill into CPU paged blocks."""
@@ -1069,3 +1144,5 @@ class PagedKVCacheManager:
         self._text_seq_map = None
         self._cpu_token_buf = None
         self._skipped_blocks.clear()
+        self._block_max_k = [None] * self.num_hidden_layers
+        self._block_min_k = [None] * self.num_hidden_layers
