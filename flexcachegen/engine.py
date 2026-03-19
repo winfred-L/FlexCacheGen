@@ -131,6 +131,42 @@ class VLMEngine:
         token_id, logits = self.model.output_head(hidden_states)
         return token_id, logits
 
+    def decoding_pipelined(self, token_id: int, cur_pos_idx: int):
+        """Pipeline decode: overlap DMA of next layer with attention+MLP of current layer."""
+        hidden_states = self.model.text_embed(token_id)
+        self.model.set_rotary_pos_emb(hidden_states, cur_pos_idx)
+        kvcm = self.kv_cache_manager
+
+        for layer_idx in range(self.num_hidden_layers):
+            # Phase 1: QKV projection
+            q, k, v, residual = self.model.attention_qkv(hidden_states, layer_idx)
+
+            # Phase 2: finalize pre-loaded DMA or sync load (layer 0)
+            if kvcm._pre_dma_layer_idx == layer_idx:
+                gpu_k, gpu_v, block_table, cache_seqlens = kvcm.finalize_pre_dma(layer_idx, q)
+            else:
+                kvcm.compute_block_importance(layer_idx, q)
+                cache_seqlens = kvcm.load_layer_to_gpu(layer_idx)
+                gpu_k, gpu_v = kvcm.get_shared_buffer()
+                block_table = kvcm.get_block_table()
+
+            # Phase 3: start async pre-load for next layer (overlaps with Phase 4+5)
+            if layer_idx + 1 < self.num_hidden_layers:
+                kvcm.predict_and_start_dma(layer_idx + 1, q)
+
+            # Phase 4: Attention (parallel with DMA stream)
+            hidden_states = self.model.attention_compute(
+                q, k, v, residual, layer_idx, gpu_k, gpu_v, block_table, cache_seqlens)
+
+            # Phase 5: MLP (still parallel with DMA)
+            hidden_states = self.model.mlp(hidden_states, layer_idx)
+
+            # Phase 6: write back new token to CPU
+            kvcm.update_after_decode(layer_idx)
+
+        token_id, logits = self.model.output_head(hidden_states)
+        return token_id, logits
+
 
     @torch.inference_mode()
     @print_duration
@@ -158,9 +194,14 @@ class VLMEngine:
 
         # 4. decoding stage
         t = perf_counter()
+        if self.config.pipeline_decode and self.config.paged_kv and self.config.block_topk_ratio is not None:
+            self.kv_cache_manager.enable_pipeline()
+            decode_fn = self.decoding_pipelined
+        else:
+            decode_fn = self.decoding
         while not self.is_finished(output_ids):
             cur_pos_idx = prompt_len + len(output_ids) - 1
-            token_id, logits = self.decoding(token_id, cur_pos_idx)
+            token_id, logits = decode_fn(token_id, cur_pos_idx)
             output_ids.append(token_id)
         print(f"[decoding] Duration: {perf_counter() - t:.2f} seconds")
         # print_cuda_memory_usage(self.config.device)

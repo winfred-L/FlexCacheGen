@@ -155,6 +155,71 @@ class Qwen3VLTextAttention(nn.Module):
         hidden_states = residual + attn_output
         return hidden_states
 
+    def qkv_project(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Execute layernorm → QKV proj → reshape → qk_norm → RoPE.
+        Returns (q, k, v, residual) for decode-only pipeline.
+        """
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        assert batch_size == 1
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        q = q.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        cos, sin = position_embeddings
+        q, k = self.apply_rotary_pos_emb(q, k, cos, sin)
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+
+        return q, k, v, residual
+
+    def decode_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        residual: torch.Tensor,
+        gpu_keys: torch.Tensor,
+        gpu_values: torch.Tensor,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute flash_attn → o_proj → residual add for decode pipeline."""
+        batch_size, seq_len, hidden_size = residual.shape
+
+        attn_output = flash_attn_with_kvcache(
+            q=q,
+            k_cache=gpu_keys,
+            v_cache=gpu_values,
+            k=k,
+            v=v,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            causal=True,
+        )
+
+        attn_output = attn_output.reshape(batch_size, seq_len, hidden_size)
+        attn_output = self.o_proj(attn_output)
+
+        hidden_states = residual + attn_output
+        return hidden_states
+
 
 class Qwen3VLTextMLP(nn.Module):
     def __init__(self, config: Config):
@@ -481,3 +546,13 @@ class Qwen3VLModel(nn.Module):
 
     def output_head(self, hidden_states: torch.Tensor) -> tuple[int, torch.Tensor]:
         return self.language_model.output_head(hidden_states)
+
+    def attention_qkv(self, hidden_states: torch.Tensor, layer_idx: int):
+        """QKV projection for pipeline decode."""
+        return self.language_model.layers[layer_idx].self_attn.qkv_project(
+            hidden_states, self.position_embeddings)
+
+    def attention_compute(self, q, k, v, residual, layer_idx, gpu_keys, gpu_values, block_table, cache_seqlens):
+        """Attention computation for pipeline decode."""
+        return self.language_model.layers[layer_idx].self_attn.decode_attention(
+            q, k, v, residual, gpu_keys, gpu_values, block_table, cache_seqlens)

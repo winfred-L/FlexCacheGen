@@ -27,7 +27,7 @@ class Config:
     max_new_tokens: int = 1024
 
     # sparsity settings
-    sparsity_strategy: str = 'none' # ['none', 'before-prefill', 'after-prefill']
+    sparsity_strategy: str = 'after-prefill' # ['none', 'before-prefill', 'after-prefill']
     sparsity_threshold: str = '0.9'
     pruning_heads: dict[int, list[int]] | None = None # {layer_idx: [head_indices]}
         # when sparsity_strategy is not 'none', pruning_heads is 'none', prune all video kv inplace.
@@ -38,7 +38,8 @@ class Config:
     # paged attention settings
     paged_kv: bool = True  # when True, always offload kv to CPU
     block_size: int = 256  # flash_attn requires page_block_size to be a multiple of 256
-    block_topk_ratio: float | None = None  # if set (0~1), keep this fraction of blocks per layer during decode
+    block_topk_ratio: float | None = 0.8  # if set (0~1), keep this fraction of blocks per layer during decode
+    pipeline_decode: bool = False  # enable DMA/compute overlap pipeline in decode
 
 
     def __init__(self, model_path: str, **kwargs):
@@ -71,6 +72,7 @@ class Config:
         if self.paged_kv:
             print("Block size:", self.block_size)
             print("Block topk ratio:", self.block_topk_ratio)
+            print("Pipeline decode:", self.pipeline_decode)
         print("========================")
             
 
