@@ -644,6 +644,9 @@ class PagedKVCacheManager:
         self._block_topk_ratio: float | None = config.block_topk_ratio
         self._num_attention_heads: int = config.hf_config.text_config.num_attention_heads
 
+        # Per-layer selected block indices for compact loading (dense path only)
+        self._layer_selected_blocks: dict[int, list[int]] = {}
+
     def set_video_info(self, video_info: VideoInfo):
         self._video_info = video_info
 
@@ -674,8 +677,11 @@ class PagedKVCacheManager:
         self._block_min_k[layer_idx] = min_k
 
     def compute_block_importance(self, layer_idx: int, q: torch.Tensor):
-        """Compute per-block importance scores and set skipped blocks.
+        """Compute per-block importance scores and select top blocks.
         q: [1, 1, H_q, D] on GPU (single decode token).
+
+        Dense layers: store selected block indices for compact loading.
+        Sparse layers: fall back to set_skipped_blocks (zeroing).
         """
         if self._block_topk_ratio is None:
             return
@@ -683,9 +689,14 @@ class PagedKVCacheManager:
             return
 
         num_blocks = self._num_blocks_used
+        num_scored = self._block_max_k[layer_idx].shape[0]  # prefill blocks only
+        scored_blocks = min(num_blocks, num_scored)
+
         topk = max(1, int(math.ceil(num_blocks * self._block_topk_ratio)))
         if topk >= num_blocks:
+            self._layer_selected_blocks.pop(layer_idx, None)
             return
+
         H_kv = self.num_kv_heads
         D = self.head_dim
         num_q_per_kv = self._num_attention_heads // H_kv
@@ -693,13 +704,13 @@ class PagedKVCacheManager:
         # q: [1, 1, H_q, D] → [H_kv, G, D]
         q_grouped = q[0, 0].view(H_kv, num_q_per_kv, D)
 
-        max_k = self._block_max_k[layer_idx][:num_blocks]  # [num_blocks, H_kv, D]
-        min_k = self._block_min_k[layer_idx][:num_blocks]
+        max_k = self._block_max_k[layer_idx][:scored_blocks]  # [scored_blocks, H_kv, D]
+        min_k = self._block_min_k[layer_idx][:scored_blocks]
 
-        # Expand for broadcasting: q [1, H_kv, G, D] × K [num_blocks, H_kv, 1, D]
+        # Expand for broadcasting: q [1, H_kv, G, D] × K [scored_blocks, H_kv, 1, D]
         q_exp = q_grouped.unsqueeze(0)          # [1, H_kv, G, D]
-        max_k_exp = max_k.unsqueeze(2)          # [num_blocks, H_kv, 1, D]
-        min_k_exp = min_k.unsqueeze(2)          # [num_blocks, H_kv, 1, D]
+        max_k_exp = max_k.unsqueeze(2)          # [scored_blocks, H_kv, 1, D]
+        min_k_exp = min_k.unsqueeze(2)          # [scored_blocks, H_kv, 1, D]
 
         # Upper bound: for each element, max(q*max_k, q*min_k)
         upper = torch.where(
@@ -707,15 +718,37 @@ class PagedKVCacheManager:
             q_exp * max_k_exp,
             q_exp * min_k_exp,
         )
-        scores = upper.sum(dim=-1)              # [num_blocks, H_kv, G]
-        block_scores = scores.amax(dim=(1, 2))  # [num_blocks]
+        scores = upper.sum(dim=-1)              # [scored_blocks, H_kv, G]
+        block_scores = scores.amax(dim=(1, 2))  # [scored_blocks]
 
-        # Always keep the last block (contains most recent tokens)
-        block_scores[-1] = float('inf')
+        # Always keep the last scored block if it's the real last block
+        if scored_blocks == num_blocks:
+            block_scores[-1] = float('inf')
 
-        _, top_indices = block_scores.topk(topk)
-        skipped = set(range(num_blocks)) - set(top_indices.cpu().tolist())
-        self.set_skipped_blocks(layer_idx, skipped)
+        _, top_indices = block_scores.topk(min(topk, scored_blocks))
+        selected = set(top_indices.cpu().tolist())
+
+        # Always include blocks beyond scored range (decode-allocated blocks)
+        for i in range(scored_blocks, num_blocks):
+            selected.add(i)
+        # Always include the last block
+        selected.add(num_blocks - 1)
+
+        selected_sorted = sorted(selected)
+
+        if len(selected_sorted) >= num_blocks:
+            # Nothing to skip
+            self._layer_selected_blocks.pop(layer_idx, None)
+            return
+
+        if self._is_sparse.get(layer_idx, False):
+            # Sparse path: can't compact, fall back to zeroing skipped blocks
+            skipped = set(range(num_blocks)) - set(selected_sorted)
+            self.set_skipped_blocks(layer_idx, skipped)
+            self._layer_selected_blocks.pop(layer_idx, None)
+        else:
+            # Dense path: use compact block table
+            self._layer_selected_blocks[layer_idx] = selected_sorted
 
     def apply_pruning_for_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply video token pruning on GPU k, v tensors (zero out specified heads at video positions).
@@ -962,24 +995,49 @@ class PagedKVCacheManager:
 
         if self._is_sparse.get(layer_idx, False):
             self._load_layer_sparse(layer_idx)
+            return torch.tensor([self._seq_len], dtype=torch.int32, device=self.device)
+
+        # Dense path
+        selected = self._layer_selected_blocks.get(layer_idx)
+        if selected is not None:
+            return self._load_layer_compact(layer_idx, selected)
         else:
             num_blocks = self._num_blocks_used
-            skipped = self._skipped_blocks.get(layer_idx)
-            if skipped:
-                for i in range(num_blocks):
-                    if i in skipped:
-                        self._gpu_k_pool[i].zero_()
-                        self._gpu_v_pool[i].zero_()
-                    else:
-                        self._gpu_k_pool[i].copy_(self._cpu_k_blocks[layer_idx][i], non_blocking=True)
-                        self._gpu_v_pool[i].copy_(self._cpu_v_blocks[layer_idx][i], non_blocking=True)
-                torch.cuda.current_stream().synchronize()
-            else:
-                self._gpu_k_pool[:num_blocks].copy_(self._cpu_k_blocks[layer_idx][:num_blocks], non_blocking=True)
-                self._gpu_v_pool[:num_blocks].copy_(self._cpu_v_blocks[layer_idx][:num_blocks], non_blocking=True)
-                torch.cuda.current_stream().synchronize()
+            self._gpu_k_pool[:num_blocks].copy_(self._cpu_k_blocks[layer_idx][:num_blocks], non_blocking=True)
+            self._gpu_v_pool[:num_blocks].copy_(self._cpu_v_blocks[layer_idx][:num_blocks], non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            # Restore full block table (may have been overwritten by compact load on previous layer)
+            self._block_table_gpu = torch.tensor(
+                [self._block_table[:self._num_blocks_used]],
+                dtype=torch.int32, device=self.device,
+            )
+            return torch.tensor([self._seq_len], dtype=torch.int32, device=self.device)
 
-        return torch.tensor([self._seq_len], dtype=torch.int32, device=self.device)
+    def _load_layer_compact(self, layer_idx: int, selected: list[int]) -> torch.Tensor:
+        """Load only selected blocks into contiguous GPU positions.
+
+        Returns compact cache_seqlens.  Attention only sees selected blocks,
+        reducing both DMA and attention computation.
+        """
+        topk = len(selected)
+
+        # Batch DMA: copy selected CPU blocks → GPU pool positions 0..topk-1
+        for i, block_idx in enumerate(selected):
+            self._gpu_k_pool[i].copy_(self._cpu_k_blocks[layer_idx][block_idx], non_blocking=True)
+            self._gpu_v_pool[i].copy_(self._cpu_v_blocks[layer_idx][block_idx], non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+
+        # Compact block table: identity mapping [0, 1, ..., topk-1]
+        self._block_table_gpu = torch.arange(
+            topk, dtype=torch.int32, device=self.device,
+        ).unsqueeze(0)
+
+        # Compact seq_len: (topk-1) full blocks + tokens in last selected block
+        last_block = selected[-1]
+        tokens_in_last = min(self.block_size, self._seq_len - last_block * self.block_size)
+        compact_seqlen = (topk - 1) * self.block_size + tokens_in_last
+
+        return torch.tensor([compact_seqlen], dtype=torch.int32, device=self.device)
 
     def _load_layer_sparse(self, layer_idx: int):
         """Sparse load: DMA compact buffers to GPU staging, then Triton scatter into GPU block pool."""
@@ -1058,15 +1116,21 @@ class PagedKVCacheManager:
 
     def _update_after_decode_dense(self, layer_idx: int, new_seq_len: int):
         """Dense path: copy single slot from GPU pool back to CPU block."""
-        block_idx = (new_seq_len - 1) // self.block_size
         pos_in_block = (new_seq_len - 1) % self.block_size
-        phys_block = self._block_table[block_idx]
+        orig_block_idx = (new_seq_len - 1) // self.block_size
 
-        self._cpu_k_blocks[layer_idx][phys_block, pos_in_block].copy_(
-            self._gpu_k_pool[phys_block, pos_in_block], non_blocking=True
+        selected = self._layer_selected_blocks.get(layer_idx)
+        if selected is not None:
+            # Compact mode: new token is in the last compact GPU block
+            gpu_block = len(selected) - 1
+        else:
+            gpu_block = self._block_table[orig_block_idx]
+
+        self._cpu_k_blocks[layer_idx][orig_block_idx, pos_in_block].copy_(
+            self._gpu_k_pool[gpu_block, pos_in_block], non_blocking=True
         )
-        self._cpu_v_blocks[layer_idx][phys_block, pos_in_block].copy_(
-            self._gpu_v_pool[phys_block, pos_in_block], non_blocking=True
+        self._cpu_v_blocks[layer_idx][orig_block_idx, pos_in_block].copy_(
+            self._gpu_v_pool[gpu_block, pos_in_block], non_blocking=True
         )
 
     def _update_after_decode_sparse(self, layer_idx: int, new_seq_len: int):
@@ -1149,3 +1213,4 @@ class PagedKVCacheManager:
         self._skipped_blocks.clear()
         self._block_max_k = [None] * self.num_hidden_layers
         self._block_min_k = [None] * self.num_hidden_layers
+        self._layer_selected_blocks.clear()
