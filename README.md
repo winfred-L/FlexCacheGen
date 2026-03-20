@@ -1,11 +1,11 @@
 # FlexCacheGen
 
+## Introduction
+
 FlexCacheGen is a **memory-efficient VLM inference framework** with a flexible KV cache manager, designed for long-context multi-modal LLM generation tasks.
 
-Combine Offloading([FlexGen](https://github.com/FMInference/FlexLLMGen)) and PagedAttention([nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)), accelerated by novel modality-aware KV cache sparsity, support latest open-sourced VLM [Qwen3-VL](https://huggingface.co/collections/Qwen/qwen3-vl).
+FlexCacheGen combines Offloading([FlexGen](https://github.com/FMInference/FlexLLMGen)) and PagedAttention([nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)), exploits novel modality-aware KV cache sparsity, supports latest open-sourced VLM [Qwen3-VL](https://huggingface.co/collections/Qwen/qwen3-vl).
 
-
-## Introduction
 
 ### Why FlexCacheGen?
 | Challenge | Traditional Approach | FlexCacheGen Solution |
@@ -23,7 +23,7 @@ Combine Offloading([FlexGen](https://github.com/FMInference/FlexLLMGen)) and Pag
 - Dynamic KV Selection without permanent eviction, better accuracy kept. (supported by multi-tier storage)
 - Paged KV cache management, less wasted memory.
 - Overlapping attention computation with KV cache IO, faster inference speed.
-- Reordering video KV based on spatial structural information, improve data locality. 
+- Reordering video KV based on spatial structural information, improved data locality. 
 
 
 ### Supported Models
