@@ -1,20 +1,37 @@
 # FlexCacheGen
 
-A VLM generation framework with a flexible KV cache manager.
+FlexCacheGen is a **memory-efficient VLM inference framework** with a flexible KV cache manager, designed for long-context multi-modal LLM generation tasks.
+
+Combine Offloading([FlexGen](https://github.com/FMInference/FlexLLMGen)) and PagedAttention([nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)), accelerated by novel modality-aware KV cache sparsity, support latest open-sourced VLM [Qwen3-VL](https://huggingface.co/collections/Qwen/qwen3-vl).
+
 
 ## Introduction
 
-Combine Offloading([FlexGen])(https://github.com/FMInference/FlexLLMGen) and PagedAttention([nano-vllm])(https://github.com/GeeeekExplorer/nano-vllm), support latest open-sourced VLM [Qwen3-VL](https://huggingface.co/collections/Qwen/qwen3-vl).
+### Why FlexCacheGen?
+| Challenge | Traditional Approach | FlexCacheGen Solution |
+|-----------|---------------------|----------------------|
+| Long video context OOM | Static KV cache | Multi-tiered offloading + Dynamic KV selection |
+| Multi-modal sparsity ignored | Uniform caching | Modality-aware algorithm + Spatial data locality |
+| Memory fragmentation | Pre-allocated cache | Paged KV management |
+| IO bottleneck | Sequential execution | Overlapping pipeline |
 
 
-Features:
+
+
+### Features
 - Modality-aware KV cache sparsity, more efficient for multi-modal LLM.
 - Dynamic KV Selection without permanent eviction, better accuracy kept. (supported by multi-tier storage)
 - Paged KV cache management, less wasted memory.
 - Overlapping attention computation with KV cache IO, faster inference speed.
+- Reordering video KV based on spatial structural information, improve data locality. 
 
 
-## Architechture
+### Supported Models
+- [Qwen3-VL](https://huggingface.co/collections/Qwen/qwen3-vl)
+
+
+
+### Architecture
 
 ```
 VLMEngine controls the generation process.
@@ -23,7 +40,9 @@ KVCacheManager manages KV cache movement and sparsity.
 ```
 
 
-## Environment
+## Quick Start
+
+### Environment
 
 ```bash
 conda create -n flexcachegen python=3.12 -y
@@ -43,14 +62,23 @@ pip install torchcodec --index-url https://download.pytorch.org/whl/cu130
 pip install -e .
 ```
 
-## Model and Dataset Download
+### Run Example
+
+```bash
+python ./scripts/example.sh
+```
+
+
+### Model and Dataset Download
 
 ```bash
 # models
-modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir /data/lyc/models/Qwen3-VL-8B-Instruct
-modelscope download --model ZhipuAI/GLM-4.6V-Flash --local_dir /data/lyc/models/GLM-4.6V-Flash
+modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir /path/to/models/Qwen3-VL-8B-Instruct
+modelscope download --model ZhipuAI/GLM-4.6V-Flash --local_dir /path/to/models/GLM-4.6V-Flash
 
 # MLVU summary
-modelscope download --dataset AI-ModelScope/MLVU --local_dir /data1/lyc/datasets/MLVU --include 'MLVU/json/9_summary/*'
-modelscope download --dataset AI-ModelScope/MLVU --local_dir /data1/lyc/datasets/MLVU --include 'MLVU/video/9_summary/*'
+modelscope download --dataset AI-ModelScope/MLVU --local_dir /path/to/datasets/MLVU --include 'MLVU/json/9_summary/*'
+modelscope download --dataset AI-ModelScope/MLVU --local_dir /path/to/datasets/MLVU --include 'MLVU/video/9_summary/*'
 ```
+
+
