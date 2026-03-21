@@ -1,8 +1,29 @@
 import math
+from dataclasses import dataclass, field
 import torch
 from flexcachegen.config import Config
 from flexcachegen.utils import VideoInfo
 from flexcachegen.kernels.sparse_scatter import sparse_scatter
+
+
+def _compute_text_positions(video_info: VideoInfo, seq_len: int) -> list[int]:
+    """Compute non-video (text) token positions from video_info."""
+    video_set = set()
+    for start, end in video_info.index_ranges:
+        for i in range(start, end + 1):
+            video_set.add(i)
+    return [i for i in range(seq_len) if i not in video_set]
+
+
+@dataclass
+class _PreDMAState:
+    """Tracks in-flight pre-DMA state for pipeline decode."""
+    layer_idx: int | None = None
+    selected: list[int] | None = None
+    buffer: int | None = None
+    event: torch.cuda.Event | None = None
+    block_table: torch.Tensor | None = None
+    cache_seqlens: torch.Tensor | None = None
 
 
 class CacheLayer:
@@ -58,11 +79,7 @@ class CacheLayer:
 
     def _compute_text_positions(self, seq_len: int) -> list[int]:
         """Compute non-video (text) positions from video_info."""
-        video_set = set()
-        for start, end in self.video_info.index_ranges:
-            for i in range(start, end + 1):
-                video_set.add(i)
-        return [i for i in range(seq_len) if i not in video_set]
+        return _compute_text_positions(self.video_info, seq_len)
 
     def lazy_initialization(
         self,
@@ -564,6 +581,17 @@ class KVCacheManager:
     def compute_block_importance(self, layer_idx: int, q: torch.Tensor):
         pass
 
+    def prepare_layer_for_decode(self, layer_idx: int, q: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, None, int]:
+        """Prepare layer KV for decode attention.
+
+        Returns (gpu_keys, gpu_values, block_table, cache_seqlens).
+        block_table is always None for non-paged mode.
+        """
+        self.compute_block_importance(layer_idx, q)
+        cache_seqlens = self.load_layer_to_gpu(layer_idx)
+        return (*self.get_shared_buffer(), self.get_block_table(), cache_seqlens)
+
 
 class PagedKVCacheManager:
     """Paged KV cache manager for CPU offload with block-level granularity.
@@ -586,7 +614,8 @@ class PagedKVCacheManager:
         self.dtype = config.dtype
         self.device = config.device
 
-        # Per-layer CPU block storage (pinned memory) — dense path
+        # --- Dense block storage ---
+        # Per-layer CPU block storage (pinned memory)
         # Each: [max_blocks_per_layer, block_size, H, D]
         self._cpu_k_blocks: list[torch.Tensor | None] = [None] * self.num_hidden_layers
         self._cpu_v_blocks: list[torch.Tensor | None] = [None] * self.num_hidden_layers
@@ -604,18 +633,14 @@ class PagedKVCacheManager:
         self._seq_len: int = 0
         self._num_blocks_used: int = 0
 
-        # Sparsity (head-level, applied during prefill but stored densely in blocks)
+        # --- Sparse compact storage ---
         self._video_info: VideoInfo | None = None
         self._pruning_heads: dict[int, list[int]] | None = config.pruning_heads
-
-        # Sparse storage (replaces dense blocks when pruning is active)
         self._is_sparse: dict[int, bool] = {}  # per-layer
         self._cpu_keys_active: list[torch.Tensor | None] = [None] * self.num_hidden_layers    # [1, max_S, A, D]
         self._cpu_values_active: list[torch.Tensor | None] = [None] * self.num_hidden_layers
         self._cpu_keys_pruned_text: list[torch.Tensor | None] = [None] * self.num_hidden_layers  # [1, max_T, P, D]
         self._cpu_values_pruned_text: list[torch.Tensor | None] = [None] * self.num_hidden_layers
-
-        # Per-layer head indices
         self._active_head_indices: dict[int, list[int]] = {}
         self._pruned_head_indices: dict[int, list[int]] = {}
         self._text_positions: list[int] = []
@@ -635,36 +660,25 @@ class PagedKVCacheManager:
         # CPU staging for decode offload (sparse path)
         self._cpu_token_buf: torch.Tensor | None = None  # [1, 1, H, D]
 
-        # Block-level skip: layer_idx → set of block indices to skip during GPU loading
+        # --- Block importance scoring ---
         self._skipped_blocks: dict[int, set[int]] = {}
-
-        # Block-level importance scoring (extreme K vectors)
         self._block_max_k: list[torch.Tensor | None] = [None] * self.num_hidden_layers  # [num_blocks, H_kv, D]
         self._block_min_k: list[torch.Tensor | None] = [None] * self.num_hidden_layers
         self._block_topk_ratio: float | None = config.block_topk_ratio
         self._num_attention_heads: int = config.hf_config.text_config.num_attention_heads
-
-        # Per-layer selected block indices for compact loading (dense path only)
         self._layer_selected_blocks: dict[int, list[int]] = {}
 
-        # Pipeline state
+        # --- Pipeline double buffer ---
         self._pipeline_enabled: bool = False
         self._dma_stream: torch.cuda.Stream | None = None
-
-        # Double buffer
         self._gpu_k_pool_A: torch.Tensor | None = None
         self._gpu_v_pool_A: torch.Tensor | None = None
         self._gpu_k_pool_B: torch.Tensor | None = None
         self._gpu_v_pool_B: torch.Tensor | None = None
         self._active_buffer: int = 0  # 0=A active for compute, 1=B
 
-        # Pre-DMA tracking
-        self._pre_dma_layer_idx: int | None = None
-        self._pre_dma_selected: list[int] | None = None
-        self._pre_dma_buffer: int | None = None
-        self._pre_dma_event: torch.cuda.Event | None = None
-        self._pre_dma_block_table: torch.Tensor | None = None
-        self._pre_dma_cache_seqlens: torch.Tensor | None = None
+        # --- Pre-DMA state ---
+        self._pre_dma = _PreDMAState()
 
     def set_video_info(self, video_info: VideoInfo):
         self._video_info = video_info
@@ -795,11 +809,7 @@ class PagedKVCacheManager:
 
     def _compute_text_positions(self, seq_len: int) -> list[int]:
         """Compute non-video (text) positions from video_info."""
-        video_set = set()
-        for start, end in self._video_info.index_ranges:
-            for i in range(start, end + 1):
-                video_set.add(i)
-        return [i for i in range(seq_len) if i not in video_set]
+        return _compute_text_positions(self._video_info, seq_len)
 
     def _save_prefill_sparse(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
         """Sparse path: store active/pruned heads separately in compact CPU buffers."""
@@ -972,6 +982,17 @@ class PagedKVCacheManager:
             return
         self._pipeline_enabled = True
 
+    def _get_buffer(self, buf_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (k_pool, v_pool) for the given buffer ID (0=A, 1=B)."""
+        if buf_id == 0:
+            return self._gpu_k_pool_A, self._gpu_v_pool_A
+        return self._gpu_k_pool_B, self._gpu_v_pool_B
+
+    def _switch_active_buffer(self, buf_id: int):
+        """Switch the active compute buffer to buf_id and update pool aliases."""
+        self._active_buffer = buf_id
+        self._gpu_k_pool, self._gpu_v_pool = self._get_buffer(buf_id)
+
     def _score_blocks(self, layer_idx: int, q: torch.Tensor) -> list[int] | None:
         """Score blocks and return sorted selected block indices, or None if all needed.
 
@@ -1004,19 +1025,24 @@ class PagedKVCacheManager:
         max_k_exp = max_k.unsqueeze(2)
         min_k_exp = min_k.unsqueeze(2)
 
+        # Upper bound on q·k attention score: when q_d >= 0, q_d * max_k_d >= q_d * k_d;
+        # when q_d < 0, q_d * min_k_d >= q_d * k_d. Sum gives per-block score upper bound.
         upper = torch.where(q_exp >= 0, q_exp * max_k_exp, q_exp * min_k_exp)
         scores = upper.sum(dim=-1)
         block_scores = scores.amax(dim=(1, 2))
 
         if scored_blocks == num_blocks:
+            # Last block contains the most recent decode token — must always be selected.
+            # Setting score to inf guarantees topk includes it.
             block_scores[-1] = float('inf')
 
         _, top_indices = block_scores.topk(min(topk, scored_blocks))
         selected = set(top_indices.cpu().tolist())
 
+        # Blocks beyond scored range are newly allocated during decode and lack extreme K data;
+        # include them unconditionally since they contain recent context.
         for i in range(scored_blocks, num_blocks):
             selected.add(i)
-        selected.add(num_blocks - 1)
 
         selected_sorted = sorted(selected)
 
@@ -1040,10 +1066,10 @@ class PagedKVCacheManager:
             return
 
         target_buf = 1 - self._active_buffer
-        tgt_k = self._gpu_k_pool_B if target_buf == 1 else self._gpu_k_pool_A
-        tgt_v = self._gpu_v_pool_B if target_buf == 1 else self._gpu_v_pool_A
+        tgt_k, tgt_v = self._get_buffer(target_buf)
 
-        # Record event on compute stream, then wait on DMA stream
+        # CUDA event sync: compute stream records → DMA stream waits → DMA executes →
+        # DMA stream records → compute stream waits (in finalize_pre_dma)
         wait_event = torch.cuda.Event()
         wait_event.record(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(self._dma_stream):
@@ -1051,20 +1077,20 @@ class PagedKVCacheManager:
             for i, blk in enumerate(predicted):
                 tgt_k[i].copy_(self._cpu_k_blocks[target_layer_idx][blk], non_blocking=True)
                 tgt_v[i].copy_(self._cpu_v_blocks[target_layer_idx][blk], non_blocking=True)
-            self._pre_dma_event = torch.cuda.Event()
-            self._pre_dma_event.record(self._dma_stream)
+            self._pre_dma.event = torch.cuda.Event()
+            self._pre_dma.event.record(self._dma_stream)
 
         # Pre-build block_table and cache_seqlens
         topk = len(predicted)
-        self._pre_dma_block_table = torch.arange(topk, dtype=torch.int32, device=self.device).unsqueeze(0)
+        self._pre_dma.block_table = torch.arange(topk, dtype=torch.int32, device=self.device).unsqueeze(0)
         last_block = predicted[-1]
         tokens_in_last = min(self.block_size, self._seq_len - last_block * self.block_size)
-        self._pre_dma_cache_seqlens = torch.tensor(
+        self._pre_dma.cache_seqlens = torch.tensor(
             [(topk - 1) * self.block_size + tokens_in_last], dtype=torch.int32, device=self.device
         )
-        self._pre_dma_layer_idx = target_layer_idx
-        self._pre_dma_selected = predicted
-        self._pre_dma_buffer = target_buf
+        self._pre_dma.layer_idx = target_layer_idx
+        self._pre_dma.selected = predicted
+        self._pre_dma.buffer = target_buf
 
     def finalize_pre_dma(self, layer_idx: int, actual_q: torch.Tensor):
         """Finalize pre-loaded DMA for layer_idx.
@@ -1072,72 +1098,63 @@ class PagedKVCacheManager:
         Compare predicted blocks with actual selection from actual_q.
         Returns (gpu_keys, gpu_values, block_table, cache_seqlens).
         """
-        # Get actual block selection
         actual_selected = self._score_blocks(layer_idx, actual_q)
-
-        predicted = self._pre_dma_selected
-        target_buf = self._pre_dma_buffer
-
-        tgt_k = self._gpu_k_pool_B if target_buf == 1 else self._gpu_k_pool_A
-        tgt_v = self._gpu_v_pool_B if target_buf == 1 else self._gpu_v_pool_A
+        predicted = self._pre_dma.selected
 
         if actual_selected is None:
-            # All blocks needed — wait for DMA, then do full sync load on active buffer
-            if self._pre_dma_event is not None:
-                torch.cuda.current_stream(self.device).wait_event(self._pre_dma_event)
-            # Fall back: load all blocks synchronously into the current active buffer
-            num_blocks = self._num_blocks_used
-            self._gpu_k_pool[:num_blocks].copy_(self._cpu_k_blocks[layer_idx][:num_blocks], non_blocking=True)
-            self._gpu_v_pool[:num_blocks].copy_(self._cpu_v_blocks[layer_idx][:num_blocks], non_blocking=True)
-            torch.cuda.current_stream(self.device).synchronize()
-            self._block_table_gpu = torch.tensor(
-                [self._block_table[:num_blocks]], dtype=torch.int32, device=self.device
-            )
-            self._clear_pre_dma_state()
-            return (self._gpu_k_pool, self._gpu_v_pool,
-                    self._block_table_gpu,
-                    torch.tensor([self._seq_len], dtype=torch.int32, device=self.device))
-
+            return self._finalize_pre_dma_full_fallback(layer_idx)
         if actual_selected == predicted:
-            # Perfect hit — wait for DMA, switch buffer aliases
-            torch.cuda.current_stream(self.device).wait_event(self._pre_dma_event)
-            self._active_buffer = target_buf
-            self._gpu_k_pool = tgt_k
-            self._gpu_v_pool = tgt_v
-            block_table = self._pre_dma_block_table
-            cache_seqlens = self._pre_dma_cache_seqlens
-            # Store selected blocks for update_after_decode
-            self._layer_selected_blocks[layer_idx] = actual_selected
-            self._clear_pre_dma_state()
-            return tgt_k, tgt_v, block_table, cache_seqlens
+            return self._finalize_pre_dma_perfect_hit(layer_idx, actual_selected)
+        return self._finalize_pre_dma_partial_hit(layer_idx, actual_selected)
 
-        # Partial hit — wait for DMA, then fix up
-        torch.cuda.current_stream(self.device).wait_event(self._pre_dma_event)
+    def _finalize_pre_dma_full_fallback(self, layer_idx: int):
+        """All blocks needed — discard pre-DMA, do full sync load on current active buffer."""
+        if self._pre_dma.event is not None:
+            torch.cuda.current_stream(self.device).wait_event(self._pre_dma.event)
+        num_blocks = self._num_blocks_used
+        self._gpu_k_pool[:num_blocks].copy_(self._cpu_k_blocks[layer_idx][:num_blocks], non_blocking=True)
+        self._gpu_v_pool[:num_blocks].copy_(self._cpu_v_blocks[layer_idx][:num_blocks], non_blocking=True)
+        torch.cuda.current_stream(self.device).synchronize()
+        self._update_block_table_gpu()
+        self._clear_pre_dma_state()
+        return (self._gpu_k_pool, self._gpu_v_pool,
+                self._block_table_gpu,
+                torch.tensor([self._seq_len], dtype=torch.int32, device=self.device))
 
-        predicted_set = set(predicted)
-        actual_set = set(actual_selected)
-        # Blocks already in tgt buffer (at predicted positions)
+    def _finalize_pre_dma_perfect_hit(self, layer_idx: int, actual_selected: list[int]):
+        """Predicted blocks match actual — switch to pre-loaded buffer directly."""
+        target_buf = self._pre_dma.buffer
+        torch.cuda.current_stream(self.device).wait_event(self._pre_dma.event)
+        self._switch_active_buffer(target_buf)
+        tgt_k, tgt_v = self._get_buffer(target_buf)
+        block_table = self._pre_dma.block_table
+        cache_seqlens = self._pre_dma.cache_seqlens
+        self._layer_selected_blocks[layer_idx] = actual_selected
+        self._clear_pre_dma_state()
+        return tgt_k, tgt_v, block_table, cache_seqlens
+
+    def _finalize_pre_dma_partial_hit(self, layer_idx: int, actual_selected: list[int]):
+        """Some predicted blocks match — reuse hits, DMA misses, then switch buffer."""
+        target_buf = self._pre_dma.buffer
+        predicted = self._pre_dma.selected
+        tgt_k, tgt_v = self._get_buffer(target_buf)
+
+        torch.cuda.current_stream(self.device).wait_event(self._pre_dma.event)
+
         predicted_pos = {blk: i for i, blk in enumerate(predicted)}
-
-        # Build actual layout: for each actual block, either reuse from predicted pos or DMA
         topk = len(actual_selected)
         for i, blk in enumerate(actual_selected):
             if blk in predicted_pos:
                 src_pos = predicted_pos[blk]
                 if src_pos != i:
-                    # GPU-internal move within target buffer
                     tgt_k[i].copy_(tgt_k[src_pos])
                     tgt_v[i].copy_(tgt_v[src_pos])
             else:
-                # Missing block — sync DMA from CPU
                 tgt_k[i].copy_(self._cpu_k_blocks[layer_idx][blk], non_blocking=True)
                 tgt_v[i].copy_(self._cpu_v_blocks[layer_idx][blk], non_blocking=True)
         torch.cuda.current_stream(self.device).synchronize()
 
-        # Switch to target buffer
-        self._active_buffer = target_buf
-        self._gpu_k_pool = tgt_k
-        self._gpu_v_pool = tgt_v
+        self._switch_active_buffer(target_buf)
 
         block_table = torch.arange(topk, dtype=torch.int32, device=self.device).unsqueeze(0)
         last_block = actual_selected[-1]
@@ -1151,27 +1168,35 @@ class PagedKVCacheManager:
 
     def _clear_pre_dma_state(self):
         """Reset pre-DMA tracking state."""
-        self._pre_dma_layer_idx = None
-        self._pre_dma_selected = None
-        self._pre_dma_buffer = None
-        self._pre_dma_event = None
-        self._pre_dma_block_table = None
-        self._pre_dma_cache_seqlens = None
+        self._pre_dma = _PreDMAState()
 
-    def load_layer_to_gpu(self, layer_idx: int) -> int:
+    def prepare_layer_for_decode(self, layer_idx: int, q: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare layer KV for decode attention.
+
+        Handles pipeline finalization, block importance, DMA, and buffer selection internally.
+        Returns (gpu_keys, gpu_values, block_table, cache_seqlens).
+        """
+        if self._pre_dma.layer_idx is not None and self._pre_dma.layer_idx == layer_idx:
+            return self.finalize_pre_dma(layer_idx, q)
+
+        self.compute_block_importance(layer_idx, q)
+        cache_seqlens = self.load_layer_to_gpu(layer_idx)
+        return (*self.get_shared_buffer(), self.get_block_table(), cache_seqlens)
+
+    def load_layer_to_gpu(self, layer_idx: int) -> torch.Tensor:
         """DMA layer KV from CPU to GPU. Uses sparse or dense path as appropriate.
 
         Returns cache_seqlens tensor for flash_attn_with_kvcache.
+        Note: KVCacheManager.load_layer_to_gpu returns int (non-paged mode doesn't need tensor form).
         """
         self._ensure_gpu_pool()
 
         if self._is_sparse.get(layer_idx, False):
             self._load_layer_sparse(layer_idx)
-            # Restore full block table (may have been overwritten by compact load on previous layer)
-            self._block_table_gpu = torch.tensor(
-                [self._block_table[:self._num_blocks_used]],
-                dtype=torch.int32, device=self.device,
-            )
+            # Sparse Triton scatter needs full sequence layout; restore full block table
+            # in case the previous dense layer's compact load overwrote it with [0,1,...,topk-1]
+            self._update_block_table_gpu()
             return torch.tensor([self._seq_len], dtype=torch.int32, device=self.device)
 
         # Dense path
@@ -1183,11 +1208,8 @@ class PagedKVCacheManager:
             self._gpu_k_pool[:num_blocks].copy_(self._cpu_k_blocks[layer_idx][:num_blocks], non_blocking=True)
             self._gpu_v_pool[:num_blocks].copy_(self._cpu_v_blocks[layer_idx][:num_blocks], non_blocking=True)
             torch.cuda.current_stream().synchronize()
-            # Restore full block table (may have been overwritten by compact load on previous layer)
-            self._block_table_gpu = torch.tensor(
-                [self._block_table[:self._num_blocks_used]],
-                dtype=torch.int32, device=self.device,
-            )
+            # Restore full block table in case the previous layer used compact load
+            self._update_block_table_gpu()
             return torch.tensor([self._seq_len], dtype=torch.int32, device=self.device)
 
     def _load_layer_compact(self, layer_idx: int, selected: list[int]) -> torch.Tensor:
@@ -1247,7 +1269,8 @@ class PagedKVCacheManager:
 
         torch.cuda.current_stream().synchronize()
 
-        # Reshape GPU block pool to [1, num_blocks*block_size, H, D] for scatter
+        # Reshape GPU block pool to [1, num_blocks*block_size, H, D] so sparse_scatter
+        # can treat it as a contiguous sequence, matching its expected input format
         full_k = self._gpu_k_pool[:num_blocks].reshape(1, num_blocks * self.block_size, H, D)
         full_v = self._gpu_v_pool[:num_blocks].reshape(1, num_blocks * self.block_size, H, D)
 
@@ -1255,7 +1278,8 @@ class PagedKVCacheManager:
         sparse_scatter(sa_k, sp_k, full_k[:, :S], self._layer_head_source[layer_idx], self._layer_head_compact_idx[layer_idx], tsm)
         sparse_scatter(sa_v, sp_v, full_v[:, :S], self._layer_head_source[layer_idx], self._layer_head_compact_idx[layer_idx], tsm)
 
-        # Zero out skipped blocks after scatter
+        # sparse_scatter doesn't know about block-topk selection; blocks that were
+        # skipped by importance scoring still contain stale data and must be zeroed
         skipped = self._skipped_blocks.get(layer_idx)
         if skipped:
             for bid in skipped:
@@ -1350,7 +1374,8 @@ class PagedKVCacheManager:
             text_pos = self._text_len
             self._cpu_values_pruned_text[layer_idx][:, text_pos, :P].copy_(self._cpu_token_buf[:, 0, pruned_indices])
 
-        # Update text_seq_map and text tracking on last layer
+        # Update text_seq_map and text tracking on last layer only — text position
+        # tracking is cross-layer shared global state, so only one layer should mutate it
         if layer_idx == self.num_hidden_layers - 1:
             if self._text_seq_map is not None:
                 self._text_seq_map[pos] = self._text_len

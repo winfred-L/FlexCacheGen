@@ -141,14 +141,8 @@ class VLMEngine:
             # Phase 1: QKV projection
             q, k, v, residual = self.model.attention_qkv(hidden_states, layer_idx)
 
-            # Phase 2: finalize pre-loaded DMA or sync load (layer 0)
-            if kvcm._pre_dma_layer_idx == layer_idx:
-                gpu_k, gpu_v, block_table, cache_seqlens = kvcm.finalize_pre_dma(layer_idx, q)
-            else:
-                kvcm.compute_block_importance(layer_idx, q)
-                cache_seqlens = kvcm.load_layer_to_gpu(layer_idx)
-                gpu_k, gpu_v = kvcm.get_shared_buffer()
-                block_table = kvcm.get_block_table()
+            # Phase 2: prepare KV cache (finalize pre-loaded DMA or sync load)
+            gpu_k, gpu_v, block_table, cache_seqlens = kvcm.prepare_layer_for_decode(layer_idx, q)
 
             # Phase 3: start async pre-load for next layer (overlaps with Phase 4+5)
             if layer_idx + 1 < self.num_hidden_layers:

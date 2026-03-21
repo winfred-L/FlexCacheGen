@@ -127,10 +127,7 @@ class Qwen3VLTextAttention(nn.Module):
             kv_cache_manager.save_prefill_kv(self.layer_idx, k, v)
 
         else: # decoding stage
-            kv_cache_manager.compute_block_importance(self.layer_idx, q)
-            cache_seqlens = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
-            gpu_keys, gpu_values = kv_cache_manager.get_shared_buffer()
-            block_table = kv_cache_manager.get_block_table()  # None for non-paged
+            gpu_keys, gpu_values, block_table, cache_seqlens = kv_cache_manager.prepare_layer_for_decode(self.layer_idx, q)
 
             # attention computation
             # Note: flash_attn_with_kvcache() will update kv cache inside
