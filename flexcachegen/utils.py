@@ -1,7 +1,20 @@
 import torch
 from time import perf_counter
 from functools import wraps
+from contextlib import contextmanager
 from dataclasses import dataclass
+
+
+@contextmanager
+def nvtx_range(name: str, enabled: bool = True):
+    """NVTX range context manager for nsys profiling. No-op when disabled."""
+    if enabled:
+        torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        if enabled:
+            torch.cuda.nvtx.range_pop()
 
 @dataclass
 class VideoInfo:

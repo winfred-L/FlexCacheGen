@@ -41,6 +41,9 @@ class Config:
     block_topk_ratio: float | None = 0.8  # if set (0~1), keep this fraction of blocks per layer during decode
     pipeline_decode: bool = False  # enable DMA/compute overlap pipeline in decode
 
+    # profiling settings
+    nsys_nvtx: bool = False  # enable NVTX annotations for nsys profiling
+
 
     def __init__(self, model_path: str, **kwargs):
         # TODO: currently only support for qwen3vl-8b
@@ -73,6 +76,7 @@ class Config:
             print("Block size:", self.block_size)
             print("Block topk ratio:", self.block_topk_ratio)
             print("Pipeline decode:", self.pipeline_decode)
+            print("NVTX profiling:", self.nsys_nvtx)
         print("========================")
             
 

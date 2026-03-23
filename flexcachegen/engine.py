@@ -8,7 +8,7 @@ from qwen_vl_utils import process_vision_info
 from flexcachegen.config import Config
 from flexcachegen.kvcache import KVCacheManager, PagedKVCacheManager
 from flexcachegen.models.qwen3vl import Qwen3VLModel
-from flexcachegen.utils import get_tensor_size, print_cuda_memory_usage, print_duration
+from flexcachegen.utils import get_tensor_size, print_cuda_memory_usage, print_duration, nvtx_range
 
 
 class VLMEngine:
@@ -123,40 +123,50 @@ class VLMEngine:
     
 
     def decoding(self, token_id: int, cur_pos_idx: int):
+        nvtx = self.config.nsys_nvtx
         hidden_states = self.model.text_embed(token_id)
         self.model.set_rotary_pos_emb(hidden_states, cur_pos_idx)
         for layer_idx in range(self.num_hidden_layers):
-            hidden_states = self.model.attention(False, hidden_states, layer_idx)
-            hidden_states = self.model.mlp(hidden_states, layer_idx)
+            with nvtx_range(f"layer_{layer_idx}/attention", nvtx):
+                hidden_states = self.model.attention(False, hidden_states, layer_idx)
+            with nvtx_range(f"layer_{layer_idx}/mlp", nvtx):
+                hidden_states = self.model.mlp(hidden_states, layer_idx)
         token_id, logits = self.model.output_head(hidden_states)
         return token_id, logits
 
     def decoding_pipelined(self, token_id: int, cur_pos_idx: int):
         """Pipeline decode: overlap DMA of next layer with attention+MLP of current layer."""
+        nvtx = self.config.nsys_nvtx
         hidden_states = self.model.text_embed(token_id)
         self.model.set_rotary_pos_emb(hidden_states, cur_pos_idx)
         kvcm = self.kv_cache_manager
 
         for layer_idx in range(self.num_hidden_layers):
             # Phase 1: QKV projection
-            q, k, v, residual = self.model.attention_qkv(hidden_states, layer_idx)
+            with nvtx_range(f"layer_{layer_idx}/qkv_proj", nvtx):
+                q, k, v, residual = self.model.attention_qkv(hidden_states, layer_idx)
 
             # Phase 2: prepare KV cache (finalize pre-loaded DMA or sync load)
-            gpu_k, gpu_v, block_table, cache_seqlens = kvcm.prepare_layer_for_decode(layer_idx, q)
+            with nvtx_range(f"layer_{layer_idx}/kv_prepare", nvtx):
+                gpu_k, gpu_v, block_table, cache_seqlens = kvcm.prepare_layer_for_decode(layer_idx, q)
 
             # Phase 3: start async pre-load for next layer (overlaps with Phase 4+5)
-            if layer_idx + 1 < self.num_hidden_layers:
-                kvcm.predict_and_start_dma(layer_idx + 1, q)
+            with nvtx_range(f"layer_{layer_idx}/predict_dma", nvtx):
+                if layer_idx + 1 < self.num_hidden_layers:
+                    kvcm.predict_and_start_dma(layer_idx + 1, q)
 
             # Phase 4: Attention (parallel with DMA stream)
-            hidden_states = self.model.attention_compute(
-                q, k, v, residual, layer_idx, gpu_k, gpu_v, block_table, cache_seqlens)
+            with nvtx_range(f"layer_{layer_idx}/attention", nvtx):
+                hidden_states = self.model.attention_compute(
+                    q, k, v, residual, layer_idx, gpu_k, gpu_v, block_table, cache_seqlens)
 
             # Phase 5: MLP (still parallel with DMA)
-            hidden_states = self.model.mlp(hidden_states, layer_idx)
+            with nvtx_range(f"layer_{layer_idx}/mlp", nvtx):
+                hidden_states = self.model.mlp(hidden_states, layer_idx)
 
             # Phase 6: write back new token to CPU
-            kvcm.update_after_decode(layer_idx)
+            with nvtx_range(f"layer_{layer_idx}/writeback", nvtx):
+                kvcm.update_after_decode(layer_idx)
 
         token_id, logits = self.model.output_head(hidden_states)
         return token_id, logits
@@ -193,10 +203,15 @@ class VLMEngine:
             decode_fn = self.decoding_pipelined
         else:
             decode_fn = self.decoding
-        while not self.is_finished(output_ids):
-            cur_pos_idx = prompt_len + len(output_ids) - 1
-            token_id, logits = decode_fn(token_id, cur_pos_idx)
-            output_ids.append(token_id)
+        nvtx = self.config.nsys_nvtx
+        with nvtx_range("decode_loop", nvtx):
+            token_idx = 0
+            while not self.is_finished(output_ids):
+                with nvtx_range(f"token_{token_idx}", nvtx):
+                    cur_pos_idx = prompt_len + len(output_ids) - 1
+                    token_id, logits = decode_fn(token_id, cur_pos_idx)
+                    output_ids.append(token_id)
+                token_idx += 1
         print(f"[decoding] Duration: {perf_counter() - t:.2f} seconds")
         # print_cuda_memory_usage(self.config.device)
 
