@@ -4,7 +4,78 @@ from flexcachegen.config import Config
 from flexcachegen.utils import VideoInfo
 from flexcachegen.kernels.sparse_scatter import sparse_scatter
 
+class KVReorder:
+    _global_instance = None
 
+    def __init__(self, video_info):
+        self.original_video_info = video_info
+
+        # prefill_len
+        if len(video_info.index_ranges) > 0:
+            self.prefill_len = max(end for _, end in video_info.index_ranges) + 1
+        else:
+            self.prefill_len = 0
+
+        # video positions
+        video_positions = []
+        for start, end in video_info.index_ranges:
+            video_positions.extend(range(start, end + 1))
+        video_set = set(video_positions)
+
+        # text positions
+        text_positions = [i for i in range(self.prefill_len) if i not in video_set]
+
+        # new order
+        self.new_order = video_positions + text_positions
+
+        # inverse order
+        self.inverse_order = [0] * self.prefill_len
+        for new_idx, old_idx in enumerate(self.new_order):
+            self.inverse_order[old_idx] = new_idx
+
+        # new video info
+        self.new_video_info = VideoInfo(
+            video_info.T_len,
+            video_info.H_len,
+            video_info.W_len,
+            [(0, len(video_positions) - 1)] if video_positions else []
+        )
+
+        KVReorder._global_instance = self
+
+    @classmethod
+    def get_global(cls):
+        if cls._global_instance is None:
+            raise RuntimeError("KVReorder not initialized")
+        return cls._global_instance
+
+    # reorder
+    def reorder(self, k, v):
+        if self.prefill_len == 0:
+            return k, v
+
+        k_new = k.clone()
+        v_new = v.clone()
+
+        k_new[:, :self.prefill_len, :, :] = k[:, self.new_order, :, :]
+        v_new[:, :self.prefill_len, :, :] = v[:, self.new_order, :, :]
+
+        return k_new, v_new
+
+    # restore
+    def restore(self, k, v):
+        if self.prefill_len == 0:
+            return k, v
+
+        k_new = k.clone()
+        v_new = v.clone()
+
+        k_new[:, :self.prefill_len, :, :] = k[:, self.inverse_order, :, :]
+        v_new[:, :self.prefill_len, :, :] = v[:, self.inverse_order, :, :]
+
+        
+        return k_new, v_new
+    
 class CacheLayer:
     """
     A cache layer that grows dynamically as more tokens are generated.
@@ -122,6 +193,10 @@ class CacheLayer:
     def _lazy_init_sparse(self, key_states, value_states, dtype, batch_size, seq_len, num_heads, head_dim, max_seq_len):
         """Sparse offload path: separate active/pruned head buffers."""
         self.is_sparse = True
+
+        # reorder
+        kv_reorder = KVReorder.get_global()
+        key_states, value_states = kv_reorder.reorder(key_states, value_states)
 
         # Compute active vs pruned head indices
         pruned_set = set(self.pruned_heads)
@@ -242,6 +317,13 @@ class CacheLayer:
         sparse_scatter(sa_k, sp_k, gpu_keys[:, :S], head_source, head_compact_idx, tsm)
         sparse_scatter(sa_v, sp_v, gpu_values[:, :S], head_source, head_compact_idx, tsm)
 
+        # restore
+        kv_reorder = KVReorder.get_global()
+        gpu_keys[:, :S], gpu_values[:, :S] = kv_reorder.restore(
+            gpu_keys[:, :S],
+            gpu_values[:, :S]
+        )
+
         # Set temporary GPU reference for decode seq_len tracking
         self.keys = gpu_keys
         self.values = gpu_values
@@ -349,6 +431,9 @@ class KVCacheManager:
         self._layer_head_source: dict[int, torch.Tensor] = {}      # layer_idx → [H] int32
         self._layer_head_compact_idx: dict[int, torch.Tensor] = {}  # layer_idx → [H] int32
         self._layer_text_seq_map: dict[int, torch.Tensor] = {}      # layer_idx → [max_S] int32
+
+        # unreorder video info, used for sparse pruning and reordering in KVCacheManager
+        self._video_info: VideoInfo | None = None
 
     def _ensure_shared_gpu_buffer(self, cache_layer: CacheLayer):
         """Lazily allocate a single-layer-sized GPU buffer for decode-time reuse."""
@@ -489,7 +574,10 @@ class KVCacheManager:
         cache_layer.pruned_heads = head_indices
 
         # Zero out specified heads at video token positions
-        video_info = cache_layer.video_info
+        
+        # use unreorder video info for pruning
+        video_info = self._video_info
+
         for start, end in video_info.index_ranges:
             k[:, start:end + 1, head_indices, :] = 0
             v[:, start:end + 1, head_indices, :] = 0
@@ -557,9 +645,17 @@ class KVCacheManager:
         self._layer_head_compact_idx.clear()
         self._layer_text_seq_map.clear()
 
+        self._video_info = None
+
     def set_video_info(self, video_info: VideoInfo):
+        self._video_info = video_info
+        # initialize
+        kv_reorder = KVReorder(video_info)
+        # replace video_info
+        new_video_info = kv_reorder.new_video_info
         for layer_idx in range(self.num_hidden_layers):
-            self._layers[layer_idx].video_info = video_info
+            # self._layers[layer_idx].video_info = video_info
+            self._layers[layer_idx].video_info = new_video_info
 
     def compute_block_importance(self, layer_idx: int, q: torch.Tensor):
         pass
@@ -667,7 +763,11 @@ class PagedKVCacheManager:
         self._pre_dma_cache_seqlens: torch.Tensor | None = None
 
     def set_video_info(self, video_info: VideoInfo):
-        self._video_info = video_info
+        # initialize
+        kv_reorder = KVReorder(video_info)
+        # replace video_info
+        self._video_info = kv_reorder.new_video_info
+        self._original_video_info = video_info
 
     def set_skipped_blocks(self, layer_idx: int, block_ids: set[int]):
         """Set which blocks to skip for a given layer during GPU loading."""
@@ -740,7 +840,7 @@ class PagedKVCacheManager:
         if not head_indices:
             return k, v
 
-        video_info = self._video_info
+        video_info = self._original_video_info
         for start, end in video_info.index_ranges:
             k[:, start:end + 1, head_indices, :] = 0
             v[:, start:end + 1, head_indices, :] = 0
@@ -803,6 +903,11 @@ class PagedKVCacheManager:
 
     def _save_prefill_sparse(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
         """Sparse path: store active/pruned heads separately in compact CPU buffers."""
+        
+        # reorder
+        kv_reorder = KVReorder.get_global()
+        k, v = kv_reorder.reorder(k, v)
+
         B, S, H, D = k.shape
         num_blocks = math.ceil(S / self.block_size)
         max_seq_len = S + self.config.max_new_tokens
@@ -1254,6 +1359,13 @@ class PagedKVCacheManager:
         tsm = self._text_seq_map[:S]
         sparse_scatter(sa_k, sp_k, full_k[:, :S], self._layer_head_source[layer_idx], self._layer_head_compact_idx[layer_idx], tsm)
         sparse_scatter(sa_v, sp_v, full_v[:, :S], self._layer_head_source[layer_idx], self._layer_head_compact_idx[layer_idx], tsm)
+
+        # restore
+        kv_reorder = KVReorder.get_global()
+        full_k[:, :S], full_v[:, :S] = kv_reorder.restore(
+            full_k[:, :S],
+            full_v[:, :S]
+        )
 
         # Zero out skipped blocks after scatter
         skipped = self._skipped_blocks.get(layer_idx)
