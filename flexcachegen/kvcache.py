@@ -1134,9 +1134,9 @@ class PagedKVCacheManager:
                     start = blk * bs
                     end = min(start + bs, self._seq_len)
                     length = end - start
-                    self._staging_compact_active_k[i, :length].copy_(
+                    self._staging_compact_active_k[i, :length, :A].copy_(
                         self._cpu_keys_active[layer_idx][0, start:end], non_blocking=True)
-                    self._staging_compact_active_v[i, :length].copy_(
+                    self._staging_compact_active_v[i, :length, :A].copy_(
                         self._cpu_values_active[layer_idx][0, start:end], non_blocking=True)
 
                 # Zero target buffer, scatter active heads
@@ -1363,9 +1363,9 @@ class PagedKVCacheManager:
                 start = blk * bs
                 end = min(start + bs, self._seq_len)
                 length = end - start
-                self._staging_compact_active_k[i, :length].copy_(
+                self._staging_compact_active_k[i, :length, :A].copy_(
                     self._cpu_keys_active[layer_idx][0, start:end], non_blocking=True)
-                self._staging_compact_active_v[i, :length].copy_(
+                self._staging_compact_active_v[i, :length, :A].copy_(
                     self._cpu_values_active[layer_idx][0, start:end], non_blocking=True)
 
             # Collect per-block pruned-text info
