@@ -22,7 +22,7 @@ class Config:
     device = torch.device('cuda:0')
 
     # kv cache settings
-    offload_kv_to_cpu: bool = True  # True: KV on CPU pinned memory, decode via DMA; False: KV on GPU, zero-copy
+    offload_kv_to_cpu: bool = True  # True: KV on CPU pinned memory; False: KV on GPU
 
 
     def __init__(self, model_type: str = 'qwen3vl-8b', **kwargs):

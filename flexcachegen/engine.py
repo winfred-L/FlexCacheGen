@@ -84,9 +84,9 @@ class VLMEngine:
 
 
     @torch.inference_mode()
-    @print_duration
     def generate_single(self, video_path: str, question: str):
         output_ids = []
+        t_start = perf_counter()
 
         # 1. process input
         inputs = self.process_input(video_path, question)
@@ -95,7 +95,7 @@ class VLMEngine:
         print_cuda_memory_usage(self.config.device)
 
         print(f"{inputs.input_ids.shape=}")
-        
+
         # 2. encoding stage
         hidden_states = self.model.encoding(inputs)
         print_cuda_memory_usage(self.config.device)
@@ -103,22 +103,42 @@ class VLMEngine:
         # 3. prefill stage
         token_id, logits = self.prefill(hidden_states)
         output_ids.append(token_id)
+        t_first_token = perf_counter()
         print_cuda_memory_usage(self.config.device)
 
         # 4. decoding stage
-        t = perf_counter()
+        t_decode_start = perf_counter()
         while not self.is_finished(output_ids):
             cur_pos_idx = prompt_len + len(output_ids) - 1
             token_id, logits = self.decoding(token_id, cur_pos_idx)
             output_ids.append(token_id)
-        print(f"[decoding] Duration: {perf_counter() - t:.2f} seconds")
+        t_end = perf_counter()
+        print(f"[decoding] Duration: {t_end - t_decode_start:.2f} seconds")
         print_cuda_memory_usage(self.config.device)
 
-        # 5. clean up kv cache
+        # 5. performance metrics
+        ttft = t_first_token - t_start
+        total_time = t_end - t_start
+        num_generated_tokens = len(output_ids)
+        num_decode_tokens = num_generated_tokens - 1
+        decode_duration = t_end - t_decode_start
+        tpot = (decode_duration / num_decode_tokens * 1000) if num_decode_tokens > 0 else 0.0
+        throughput = num_generated_tokens / total_time if total_time > 0 else 0.0
+
+        print(f"\n{'=' * 45}")
+        print(f" Performance Metrics")
+        print(f"{'=' * 45}")
+        print(f" TTFT:                {ttft:.2f} s")
+        print(f" TPOT:                {tpot:.2f} ms")
+        print(f" Generated tokens:    {num_generated_tokens}")
+        print(f" Total time:          {total_time:.2f} s")
+        print(f" Throughput:          {throughput:.2f} tokens/s")
+        print(f"{'=' * 45}\n")
+
+        # 6. clean up kv cache
         self.kv_cache_manager.clear()
-        print_cuda_memory_usage(self.config.device)
 
-        # 6. decode output text
+        # 7. decode output text
         output_text = self.processor.batch_decode(
             [output_ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
