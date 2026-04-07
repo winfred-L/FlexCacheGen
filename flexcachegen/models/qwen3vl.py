@@ -405,6 +405,7 @@ class Qwen3VLModel(nn.Module):
         video_pad_token_id = 151656 # <|video_pad|>
 
         T_len, H_len, W_len = inputs.video_grid_thw[0].tolist()
+        print(f"Original video grid size: T={T_len}, H={H_len}, W={W_len}")
         spatial_merge_size = self.config.spatial_merge_size
         H_len = H_len // spatial_merge_size
         W_len = W_len // spatial_merge_size

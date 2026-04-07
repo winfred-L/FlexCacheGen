@@ -49,11 +49,13 @@ class VLMEngine:
                     {
                         "type": "video",
                         "video": video_path,
+                        "resized_height": 16 * 32,
+                        "resized_width": 16 * 32,
                         # restrict the resolution of individual frames in the video
-                        # "min_pixels": 4 * 32 * 32,
-                        # "max_pixels": 640 * 32 * 32,
+                        # "min_pixels": 275 * 32 * 32,
+                        # "max_pixels": 275 * 32 * 32,
                         # limit the total number of tokens in the video
-                        "total_pixels": 100 * 1024 * 32 * 32, # 64k tokens
+                        # "total_pixels": 100 * 1024 * 32 * 32, # 64k tokens
                         # accept either `fps` or `nframes`
                         # "fps": 2.0,
                         # "nframes": 32, #2048,
@@ -64,6 +66,7 @@ class VLMEngine:
         ]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         images, videos, video_kwargs = process_vision_info(messages, image_patch_size=16, return_video_kwargs=True, return_video_metadata=True)
+        print(video_kwargs)
 
         # each video returns as (video_tensor, video_metadata)
         # split the videos and according metadatas

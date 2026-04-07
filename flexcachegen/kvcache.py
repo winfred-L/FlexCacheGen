@@ -151,6 +151,10 @@ class CacheLayer:
         self.seq_len = seq_len
         self.max_seq_len = max_seq_len
 
+        # reorder
+        kv_reorder = KVReorder.get_global()
+        key_states, value_states = kv_reorder.reorder(key_states, value_states)
+
         if self.config.offload_kv_to_cpu:
             # Check if sparse path should be used
             if self.pruned_heads is not None and len(self.pruned_heads) > 0:
@@ -193,10 +197,6 @@ class CacheLayer:
     def _lazy_init_sparse(self, key_states, value_states, dtype, batch_size, seq_len, num_heads, head_dim, max_seq_len):
         """Sparse offload path: separate active/pruned head buffers."""
         self.is_sparse = True
-
-        # reorder
-        kv_reorder = KVReorder.get_global()
-        key_states, value_states = kv_reorder.reorder(key_states, value_states)
 
         # Compute active vs pruned head indices
         pruned_set = set(self.pruned_heads)
@@ -699,6 +699,7 @@ class PagedKVCacheManager:
         # Sequence tracking
         self._seq_len: int = 0
         self._num_blocks_used: int = 0
+        self._num_video_blocks: int = 0
 
         # Sparsity (head-level, applied during prefill but stored densely in blocks)
         self._video_info: VideoInfo | None = None
@@ -738,6 +739,7 @@ class PagedKVCacheManager:
         self._block_max_k: list[torch.Tensor | None] = [None] * self.num_hidden_layers  # [num_blocks, H_kv, D]
         self._block_min_k: list[torch.Tensor | None] = [None] * self.num_hidden_layers
         self._block_topk_ratio: float | None = config.block_topk_ratio
+        self._video_block_ratio: float = config.video_block_ratio
         self._num_attention_heads: int = config.hf_config.text_config.num_attention_heads
 
         # Per-layer selected block indices for compact loading (dense path only)
@@ -768,6 +770,8 @@ class PagedKVCacheManager:
         # replace video_info
         self._video_info = kv_reorder.new_video_info
         self._original_video_info = video_info
+        # compute video block num
+        self._num_video_blocks = self._video_info.index_ranges[-1][1] // self.block_size + 1
 
     def set_skipped_blocks(self, layer_idx: int, block_ids: set[int]):
         """Set which blocks to skip for a given layer during GPU loading."""
@@ -1116,8 +1120,29 @@ class PagedKVCacheManager:
         if scored_blocks == num_blocks:
             block_scores[-1] = float('inf')
 
-        _, top_indices = block_scores.topk(min(topk, scored_blocks))
-        selected = set(top_indices.cpu().tolist())
+        num_video_blocks = self._num_video_blocks
+        video_ratio = self._video_block_ratio
+
+        video_scores = block_scores[:num_video_blocks]
+        text_scores = block_scores[num_video_blocks:scored_blocks]
+
+        # text part
+        num_text_blocks = scored_blocks - num_video_blocks
+        topk_text = max(1, int(math.ceil(num_text_blocks * self._block_topk_ratio)))
+        _, text_indices = text_scores.topk(min(topk_text, num_text_blocks))
+        text_selected = set((text_indices + num_video_blocks).cpu().tolist())
+
+        # video part
+        if len(video_scores) > 0:
+            threshold = torch.quantile(text_scores.float(), 1 - video_ratio)
+            video_selected = set(
+                i for i in range(num_video_blocks)
+                if block_scores[i] >= threshold
+            )
+        else:
+            video_selected = set()
+
+        selected = text_selected | video_selected
 
         for i in range(scored_blocks, num_blocks):
             selected.add(i)
