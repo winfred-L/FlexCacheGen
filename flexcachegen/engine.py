@@ -16,12 +16,9 @@ class VLMEngine:
     Only support single GPU single batch inference now.
     '''
 
-    def __init__(self, model_path, **kwargs):
+    def __init__(self, model_type='qwen3vl-8b', **kwargs):
         # config
-        # config_fields = {field.name for field in fields(Config)}
-        # config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        # self.config = Config(model_path, **config_kwargs)
-        self.config = Config(model_path)
+        self.config = Config(model_type)
         # kv cache manager
         self.kv_cache_manager = KVCacheManager(self.config)
         # model

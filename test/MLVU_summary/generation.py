@@ -7,8 +7,7 @@ from flexcachegen.engine import VLMEngine
 
 
 def main():
-    model_path = '/data/lyc/models/Qwen3-VL-8B-Instruct'
-    vlm = VLMEngine(model_path)
+    vlm = VLMEngine(model_type='qwen3vl-8b')
 
     # load dataset json
     dataset_path = '/data1/lyc/datasets/MLVU/MLVU'

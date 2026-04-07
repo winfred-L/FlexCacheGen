@@ -106,33 +106,37 @@ class Qwen3VLTextAttention(nn.Module):
         k = k.transpose(1, 2).contiguous()
 
         if is_prefill:
-            # store kv to kv cache pool
-            kv_cache_manager.gpu_buffer[self.layer_idx].lazy_initialization(k,v)
-            kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
+            # Store KV into CacheLayer (CPU pinned or GPU, depending on offload
+            # config) and lazily allocate the shared GPU buffer.
+            # Prefill attention uses the raw k, v from projection directly —
+            # neither CacheLayer nor the shared GPU buffer is read here.
+            kv_cache_manager.prefill_store_and_offload(self.layer_idx, k, v)
 
             # attention computation
             # shape: (batch, seq, num_attention_heads, head_dim)
             attn_output = flash_attn_func(q, k, v, causal=True)
-        
-        else: # decoding stage
-            # retrieve kv to GPU from kv cache pool
-            cache_layer = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
 
-            # attention computation
-            # flash_attn_with_kvcache() will update kv cache inside
+        else: # decoding stage
+            # Copy this layer's KV from CacheLayer storage into the shared GPU
+            # buffer. Always goes through the buffer (even when CacheLayer is on
+            # GPU) to decouple storage format from compute format.
+            k_cache, v_cache, cache_seqlens = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
+
+            # flash_attn_with_kvcache computes attention against cached KV and
+            # writes the new token's k, v into the GPU buffer at position cache_seqlens
             attn_output = flash_attn_with_kvcache(
                 q=q,
-                k_cache=cache_layer.keys,
-                v_cache=cache_layer.values,
+                k_cache=k_cache,
+                v_cache=v_cache,
                 k=k,
                 v=v,
-                cache_seqlens=cache_layer.seq_len,
+                cache_seqlens=cache_seqlens,
                 causal=True,
             )
-            cache_layer.seq_len += 1
 
-            # store kv to kv cache pool
-            kv_cache_manager.offload_layer_to_cpu(self.layer_idx)
+            # Sync the newly written token's KV from GPU buffer back to CacheLayer
+            # storage, and advance this layer's seq_len counter
+            kv_cache_manager.offload_after_decode(self.layer_idx)
 
         # shape: (batch, seq, hidden_size)
         attn_output = attn_output.reshape(batch_size, seq_len, hidden_size)
