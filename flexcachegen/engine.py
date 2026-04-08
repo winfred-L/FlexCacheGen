@@ -5,7 +5,7 @@ from tqdm.auto import tqdm
 from transformers import AutoProcessor
 
 from flexcachegen.config import Config
-from flexcachegen.kvcache import KVCacheManager
+from flexcachegen.kvcache import KVCacheManager, SparseKVCacheManager
 from flexcachegen.models.qwen3vl import Qwen3VLModel
 from flexcachegen.utils import get_tensor_size, print_cuda_memory_usage, print_duration
 
@@ -20,7 +20,10 @@ class VLMEngine:
         # config
         self.config = Config(model_type)
         # kv cache manager
-        self.kv_cache_manager = KVCacheManager(self.config)
+        if self.config.sparse_kv:
+            self.kv_cache_manager = SparseKVCacheManager(self.config)
+        else:
+            self.kv_cache_manager = KVCacheManager(self.config)
         # model
         self.model = Qwen3VLModel(self.config, self.kv_cache_manager).to(self.config.device)
         self.processor = AutoProcessor.from_pretrained(self.config.model_path, use_fast=True)
@@ -95,6 +98,11 @@ class VLMEngine:
         print_cuda_memory_usage(self.config.device)
 
         print(f"{inputs.input_ids.shape=}")
+
+        # 1.5 extract video info for sparse KV cache
+        if isinstance(self.kv_cache_manager, SparseKVCacheManager):
+            video_info = self.model.get_video_info(inputs)
+            self.kv_cache_manager.set_video_info(video_info, prompt_len)
 
         # 2. encoding stage
         hidden_states = self.model.encoding(inputs)

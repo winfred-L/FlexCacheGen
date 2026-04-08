@@ -1,5 +1,6 @@
 import torch
 from flexcachegen.config import Config
+from flexcachegen.utils import VideoInfo
 
 
 class CacheLayer:
@@ -293,4 +294,219 @@ class KVCacheManager:
         ]
         self._gpu_keys = None
         self._gpu_values = None
+        torch.cuda.empty_cache()
+
+
+class SparseCacheLayer(CacheLayer):
+    """
+    Per-layer KV cache that stores video and text KV separately.
+
+    Video KV is fixed after prefill; only text KV grows during decode.
+    The GPU buffer layout during decode is [video_kv | text_kv], which is
+    mathematically equivalent to the original ordering.
+    """
+
+    def __init__(self, max_new_tokens: int):
+        # Skip CacheLayer.__init__ to avoid conflict with seq_len property.
+        self.max_seq_len: int = 0
+        self.max_new_tokens = max_new_tokens
+        self.video_keys: torch.Tensor | None = None
+        self.video_values: torch.Tensor | None = None
+        self.text_keys: torch.Tensor | None = None
+        self.text_values: torch.Tensor | None = None
+        self.video_len: int = 0
+        self.text_seq_len: int = 0
+
+    @property
+    def seq_len(self) -> int:
+        return self.video_len + self.text_seq_len
+
+    def initialize_from_prefill(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        offload: bool = True,
+        video_indices: torch.Tensor | None = None,
+        text_indices: torch.Tensor | None = None,
+    ):
+        """
+        Split prefill KV into video and text parts and store separately.
+
+        Args:
+            key_states:    GPU tensor [1, prefill_len, num_kv_heads, head_dim]
+            value_states:  GPU tensor, same shape
+            offload:       CPU pinned memory if True, GPU if False
+            video_indices: 1-D tensor of video token positions in the prefill sequence
+            text_indices:  1-D tensor of text token positions in the prefill sequence
+        """
+        batch_size, prefill_len, num_heads, head_dim = key_states.shape
+
+        video_len = video_indices.shape[0]
+        text_len = text_indices.shape[0]
+        assert video_len + text_len == prefill_len
+
+        self.video_len = video_len
+        self.text_seq_len = text_len
+        self.max_seq_len = prefill_len + self.max_new_tokens
+
+        # Extract video and text KV from the interleaved prefill tensor
+        video_k = key_states[:, video_indices]    # [1, video_len, H, D]
+        video_v = value_states[:, video_indices]
+        text_k = key_states[:, text_indices]       # [1, text_len, H, D]
+        text_v = value_states[:, text_indices]
+
+        alloc_kwargs = dict(dtype=key_states.dtype)
+        if offload:
+            alloc_kwargs.update(device='cpu', pin_memory=True)
+        else:
+            alloc_kwargs.update(device=key_states.device)
+
+        # Video storage: exact size, never grows
+        self.video_keys = torch.empty(
+            (batch_size, video_len, num_heads, head_dim), **alloc_kwargs,
+        )
+        self.video_values = torch.empty(
+            (batch_size, video_len, num_heads, head_dim), **alloc_kwargs,
+        )
+        self.video_keys.copy_(video_k)
+        self.video_values.copy_(video_v)
+
+        # Text storage: prefill text + room for max_new_tokens
+        text_max_len = text_len + self.max_new_tokens
+        self.text_keys = torch.empty(
+            (batch_size, text_max_len, num_heads, head_dim), **alloc_kwargs,
+        )
+        self.text_values = torch.empty(
+            (batch_size, text_max_len, num_heads, head_dim), **alloc_kwargs,
+        )
+        self.text_keys[:, :text_len].copy_(text_k)
+        self.text_values[:, :text_len].copy_(text_v)
+
+    def update_from_gpu_buffer(
+        self,
+        gpu_keys: torch.Tensor,
+        gpu_values: torch.Tensor,
+    ):
+        """
+        Copy new text token's KV from GPU buffer back to text storage.
+
+        In the GPU buffer, new token sits at position video_len + text_seq_len.
+        """
+        buf_pos = self.video_len + self.text_seq_len
+        self.text_keys[:, self.text_seq_len:self.text_seq_len + 1].copy_(
+            gpu_keys[:, buf_pos:buf_pos + 1]
+        )
+        self.text_values[:, self.text_seq_len:self.text_seq_len + 1].copy_(
+            gpu_values[:, buf_pos:buf_pos + 1]
+        )
+        self.text_seq_len += 1
+
+
+class SparseKVCacheManager(KVCacheManager):
+    """
+    KV cache manager that stores video and text KV separately per layer.
+
+    GPU buffer layout during decode: [video_kv | text_kv].
+    Video KV is fixed after prefill; only text KV region grows.
+    """
+
+    def __init__(self, config: Config):
+        # Skip KVCacheManager.__init__ to use SparseCacheLayer instead
+        self.config = config
+        self.offload = config.offload_kv_to_cpu
+        self.num_hidden_layers = config.hf_config.text_config.num_hidden_layers
+
+        self.layers: list[SparseCacheLayer] = [
+            SparseCacheLayer(self.config.max_new_tokens) for _ in range(self.num_hidden_layers)
+        ]
+        self._gpu_keys: torch.Tensor | None = None
+        self._gpu_values: torch.Tensor | None = None
+
+        # Video metadata — set by set_video_info() before prefill
+        self.video_info: VideoInfo | None = None
+        self.video_indices: torch.Tensor | None = None
+        self.text_indices: torch.Tensor | None = None
+
+    def set_video_info(self, video_info: VideoInfo, prefill_len: int):
+        """
+        Precompute video and text index tensors from VideoInfo.
+
+        Args:
+            video_info: VideoInfo from get_video_info()
+            prefill_len: total number of tokens in the prefill sequence
+        """
+        self.video_info = video_info
+
+        # Build set of all video token positions from index_ranges
+        video_pos = set()
+        for start_idx, end_idx in video_info.index_ranges:
+            video_pos.update(range(start_idx, end_idx + 1))  # end_idx is inclusive
+
+        video_list = sorted(video_pos)
+        text_list = [i for i in range(prefill_len) if i not in video_pos]
+
+        self.video_indices = torch.tensor(video_list, dtype=torch.long)
+        self.text_indices = torch.tensor(text_list, dtype=torch.long)
+
+    def prefill_store_and_offload(
+        self,
+        layer_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ):
+        cache_layer = self.layers[layer_idx]
+        cache_layer.initialize_from_prefill(
+            key_states, value_states,
+            offload=self.offload,
+            video_indices=self.video_indices,
+            text_indices=self.text_indices,
+        )
+
+        # Lazy-allocate shared GPU buffer (same as parent)
+        batch_size, _, num_heads, head_dim = key_states.shape
+        self._ensure_gpu_buffer(
+            batch_size,
+            cache_layer.max_seq_len,
+            num_heads,
+            head_dim,
+            key_states.dtype,
+        )
+
+    def load_layer_to_gpu(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        Reconstruct dense GPU buffer as [video_kv | text_kv].
+        """
+        cache_layer = self.layers[layer_idx]
+        video_len = cache_layer.video_len
+        text_seq_len = cache_layer.text_seq_len
+        total_len = video_len + text_seq_len
+
+        # Copy video KV into buffer [0:video_len]
+        self._gpu_keys[:, :video_len].copy_(cache_layer.video_keys, non_blocking=True)
+        self._gpu_values[:, :video_len].copy_(cache_layer.video_values, non_blocking=True)
+
+        # Copy text KV into buffer [video_len:video_len+text_seq_len]
+        self._gpu_keys[:, video_len:total_len].copy_(
+            cache_layer.text_keys[:, :text_seq_len], non_blocking=True
+        )
+        self._gpu_values[:, video_len:total_len].copy_(
+            cache_layer.text_values[:, :text_seq_len], non_blocking=True
+        )
+
+        torch.cuda.current_stream().synchronize()
+
+        return self._gpu_keys, self._gpu_values, total_len
+
+    def offload_after_decode(self, layer_idx: int):
+        self.layers[layer_idx].update_from_gpu_buffer(self._gpu_keys, self._gpu_values)
+
+    def clear(self):
+        self.layers = [
+            SparseCacheLayer(self.config.max_new_tokens) for _ in range(self.num_hidden_layers)
+        ]
+        self._gpu_keys = None
+        self._gpu_values = None
+        self.video_info = None
+        self.video_indices = None
+        self.text_indices = None
         torch.cuda.empty_cache()
