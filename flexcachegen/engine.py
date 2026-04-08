@@ -1,13 +1,12 @@
 import torch
 from time import perf_counter
-from tqdm.auto import tqdm
 
 from transformers import AutoProcessor
 
 from flexcachegen.config import Config
 from flexcachegen.kvcache import KVCacheManager, SparseKVCacheManager
 from flexcachegen.models.qwen3vl import Qwen3VLModel
-from flexcachegen.utils import get_tensor_size, print_cuda_memory_usage, print_duration
+from flexcachegen.utils import format_bytes
 
 
 class VLMEngine:
@@ -17,6 +16,7 @@ class VLMEngine:
     '''
 
     def __init__(self, model_type='qwen3vl-8b', **kwargs):
+        t_init = perf_counter()
         # config
         self.config = Config(model_type)
         # kv cache manager
@@ -28,8 +28,10 @@ class VLMEngine:
         self.model = Qwen3VLModel(self.config, self.kv_cache_manager).to(self.config.device)
         self.processor = AutoProcessor.from_pretrained(self.config.model_path, use_fast=True)
         self.num_hidden_layers = self.config.hf_config.text_config.num_hidden_layers
+        torch.cuda.synchronize()
+        self.model_memory = torch.cuda.memory_allocated(self.config.device)
+        print(f"Model loaded in {perf_counter() - t_init:.2f} s\n")
 
-    @print_duration
     def process_input(
         self,
         video_path: str,
@@ -66,7 +68,6 @@ class VLMEngine:
         return output_ids[-1] in self.config.eos_token_id or len(output_ids) >= self.config.max_new_tokens
     
 
-    @print_duration
     def prefill(self, hidden_states: torch.Tensor):
         for layer_idx in range(self.num_hidden_layers):
             hidden_states = self.model.attention(True, hidden_states, layer_idx)
@@ -88,60 +89,142 @@ class VLMEngine:
 
     @torch.inference_mode()
     def generate_single(self, video_path: str, question: str):
+        """Generate without any profiling overhead."""
         output_ids = []
-        t_start = perf_counter()
 
         # 1. process input
         inputs = self.process_input(video_path, question)
         inputs = inputs.to(self.config.device)
         prompt_len = inputs["input_ids"].shape[1]
-        print_cuda_memory_usage(self.config.device)
 
-        print(f"{inputs.input_ids.shape=}")
-
-        # 1.5 extract video info for sparse KV cache
         if isinstance(self.kv_cache_manager, SparseKVCacheManager):
             video_info = self.model.get_video_info(inputs)
             self.kv_cache_manager.set_video_info(video_info, prompt_len)
 
         # 2. encoding stage
         hidden_states = self.model.encoding(inputs)
-        print_cuda_memory_usage(self.config.device)
 
         # 3. prefill stage
         token_id, logits = self.prefill(hidden_states)
         output_ids.append(token_id)
-        t_first_token = perf_counter()
-        print_cuda_memory_usage(self.config.device)
 
         # 4. decoding stage
-        t_decode_start = perf_counter()
         while not self.is_finished(output_ids):
             cur_pos_idx = prompt_len + len(output_ids) - 1
             token_id, logits = self.decoding(token_id, cur_pos_idx)
             output_ids.append(token_id)
-        t_end = perf_counter()
-        print(f"[decoding] Duration: {t_end - t_decode_start:.2f} seconds")
-        print_cuda_memory_usage(self.config.device)
 
-        # 5. performance metrics
-        ttft = t_first_token - t_start
+        # 5. clean up kv cache
+        self.kv_cache_manager.clear()
+
+        # 6. decode output text
+        output_text = self.processor.batch_decode(
+            [output_ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+
+        return output_text
+
+    @torch.inference_mode()
+    def generate_single_info(self, video_path: str, question: str):
+        """Generate with detailed performance and memory profiling."""
+        output_ids = []
+        device = self.config.device
+        t_start = perf_counter()
+
+        # global peak tracking (never reset)
+        torch.cuda.reset_peak_memory_stats(device)
+
+        # 1. process input
+        inputs = self.process_input(video_path, question)
+        inputs = inputs.to(device)
+        prompt_len = inputs["input_ids"].shape[1]
+
+        if isinstance(self.kv_cache_manager, SparseKVCacheManager):
+            video_info = self.model.get_video_info(inputs)
+            self.kv_cache_manager.set_video_info(video_info, prompt_len)
+        t_process = perf_counter()
+
+        # 2. encoding stage
+        torch.cuda.synchronize()
+        mem_before_encoding = torch.cuda.memory_allocated(device)
+        peak_global = torch.cuda.max_memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        hidden_states = self.model.encoding(inputs)
+        torch.cuda.synchronize()
+        peak_encoding = torch.cuda.max_memory_allocated(device) - mem_before_encoding
+        peak_global = max(peak_global, torch.cuda.max_memory_allocated(device))
+        t_encoding = perf_counter()
+
+        # 3. prefill stage
+        torch.cuda.synchronize()
+        mem_before_prefill = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        token_id, logits = self.prefill(hidden_states)
+        output_ids.append(token_id)
+        torch.cuda.synchronize()
+        peak_prefill = torch.cuda.max_memory_allocated(device) - mem_before_prefill
+        peak_global = max(peak_global, torch.cuda.max_memory_allocated(device))
+        t_prefill = perf_counter()
+
+        # snapshot KV cache stats after prefill (before decode modifies seq_len)
+        kv_stats = self.kv_cache_manager.get_memory_stats()
+
+        # 4. decoding stage
+        torch.cuda.synchronize()
+        mem_before_decoding = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        while not self.is_finished(output_ids):
+            cur_pos_idx = prompt_len + len(output_ids) - 1
+            token_id, logits = self.decoding(token_id, cur_pos_idx)
+            output_ids.append(token_id)
+        torch.cuda.synchronize()
+        peak_decoding = torch.cuda.max_memory_allocated(device) - mem_before_decoding
+        peak_global = max(peak_global, torch.cuda.max_memory_allocated(device))
+        t_end = perf_counter()
+
+        # 5. print results
+        print(f"{' '+'Input' + ' ':=^50}")
+        print(f"Video: {video_path}")
+        print(f"Question: {question}")
+
+        # 5.1 performance metrics
+        ttft = t_prefill - t_start
         total_time = t_end - t_start
         num_generated_tokens = len(output_ids)
         num_decode_tokens = num_generated_tokens - 1
-        decode_duration = t_end - t_decode_start
+        decode_duration = t_end - t_prefill
         tpot = (decode_duration / num_decode_tokens * 1000) if num_decode_tokens > 0 else 0.0
         throughput = num_generated_tokens / total_time if total_time > 0 else 0.0
 
-        print(f"\n{'=' * 45}")
-        print(f" Performance Metrics")
-        print(f"{'=' * 45}")
+        print(f"{' '+'Performance Metrics' + ' ':=^50}")
+        print(f" Total time:          {total_time:.2f} s")
+        print(f"   Process input:     {t_process - t_start:.2f} s")
+        print(f"   Encoding:          {t_encoding - t_process:.2f} s")
+        print(f"   Prefill:           {t_prefill - t_encoding:.2f} s")
+        print(f"   Decoding:          {decode_duration:.2f} s")
         print(f" TTFT:                {ttft:.2f} s")
         print(f" TPOT:                {tpot:.2f} ms")
+        print(f" Prompt tokens:       {prompt_len}")
         print(f" Generated tokens:    {num_generated_tokens}")
-        print(f" Total time:          {total_time:.2f} s")
         print(f" Throughput:          {throughput:.2f} tokens/s")
-        print(f"{'=' * 45}\n")
+
+        # 5.2 memory report
+        kv_total = kv_stats["kv_cache_gpu_bytes"] + kv_stats["kv_cache_cpu_bytes"]
+        kv_device = "CPU" if self.config.offload_kv_to_cpu else "GPU"
+        n_layers = self.num_hidden_layers
+
+        print(f"{' '+'Memory Usage' + ' ':=^50}")
+        print(f" Model weights:       {format_bytes(self.model_memory)}")
+        print(f" KV cache (all):      {format_bytes(kv_total)}  ({n_layers} layers, {kv_device})")
+        if isinstance(self.kv_cache_manager, SparseKVCacheManager):
+            print(f"   Video KV:          {format_bytes(kv_stats['video_kv_bytes'])}")
+            print(f"   Text KV:           {format_bytes(kv_stats['text_kv_bytes'])}")
+        print(f" GPU KV buffer:       {format_bytes(kv_stats['gpu_buffer_bytes'])}")
+        print(f" Peak activation:")
+        print(f"   Encoding:          {format_bytes(peak_encoding)}")
+        print(f"   Prefill:           {format_bytes(peak_prefill)}")
+        print(f"   Decoding:          {format_bytes(peak_decoding)}")
+        print(f" Peak global:         {format_bytes(peak_global)}")
 
         # 6. clean up kv cache
         self.kv_cache_manager.clear()
@@ -150,5 +233,8 @@ class VLMEngine:
         output_text = self.processor.batch_decode(
             [output_ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
+        print(f"{' '+'Output' + ' ':=^50}")
+        print(output_text)
+        print()
 
         return output_text

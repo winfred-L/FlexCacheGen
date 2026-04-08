@@ -23,7 +23,7 @@ class Config:
     device = torch.device('cuda:0')
 
     # kv cache settings
-    offload_kv_to_cpu: bool = True
+    offload_kv_to_cpu: bool = False
         # True: KV on CPU pinned memory
         # False: KV on GPU (but gpu kv buffer still in use)
     sparse_kv: bool = True
@@ -48,10 +48,10 @@ class Config:
 
     
     def print_settings(self):
-        print("==== Configurations ====")
-        print("Model type:", self.model_type)
-        print("Temperature:", self.temperature)
-        print("Max new tokens:", self.max_new_tokens)
-        print("Offload KV to CPU:", self.offload_kv_to_cpu)
-        print("Sparse KV:", self.sparse_kv)
-        print("========================")
+        print(f"{' '+'Configurations' + ' ':=^50}")
+        print("Model type:        ", self.model_type)
+        print("Temperature:       ", self.temperature)
+        print("Max new tokens:    ", self.max_new_tokens)
+        print("Offload KV to CPU: ", self.offload_kv_to_cpu)
+        print("Sparse KV:         ", self.sparse_kv)
+        print("="*50)

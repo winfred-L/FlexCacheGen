@@ -12,7 +12,7 @@ from flash_attn import flash_attn_func, flash_attn_with_kvcache
 from flexcachegen.config import Config
 from flexcachegen.kvcache import KVCacheManager
 from flexcachegen.models.qwen3vl_util import get_video_features, get_placeholder_mask, get_rope_index
-from flexcachegen.utils import VideoInfo, print_duration
+from flexcachegen.utils import VideoInfo
 
 
 
@@ -246,7 +246,6 @@ class Qwen3VLModel(nn.Module):
     visual_pos_masks = None
     deepstack_video_embeds = None
     
-    @print_duration
     def __init__(self, config: Config, kv_cache_manager: KVCacheManager):
         super().__init__()
         self.config = config
@@ -318,7 +317,6 @@ class Qwen3VLModel(nn.Module):
         torch.cuda.empty_cache()
 
 
-    @print_duration
     def get_video_info(self, inputs: BatchFeature):
         '''
         Qwen3-VL prompt format:
@@ -356,7 +354,6 @@ class Qwen3VLModel(nn.Module):
         )
         
 
-    @print_duration
     def encoding(self, inputs):
 
         # get inputs

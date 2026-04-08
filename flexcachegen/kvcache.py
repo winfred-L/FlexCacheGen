@@ -296,6 +296,29 @@ class KVCacheManager:
         self._gpu_values = None
         torch.cuda.empty_cache()
 
+    def get_memory_stats(self) -> dict[str, int]:
+        """Return KV cache memory usage in bytes."""
+        kv_gpu = 0
+        kv_cpu = 0
+        for layer in self.layers:
+            if layer.keys is None:
+                continue
+            layer_bytes = layer.keys.nbytes + layer.values.nbytes
+            if layer.keys.is_cuda:
+                kv_gpu += layer_bytes
+            else:
+                kv_cpu += layer_bytes
+
+        gpu_buffer = 0
+        if self._gpu_keys is not None:
+            gpu_buffer = self._gpu_keys.nbytes + self._gpu_values.nbytes
+
+        return {
+            "kv_cache_gpu_bytes": kv_gpu,
+            "kv_cache_cpu_bytes": kv_cpu,
+            "gpu_buffer_bytes": gpu_buffer,
+        }
+
 
 class SparseCacheLayer(CacheLayer):
     """
@@ -510,3 +533,34 @@ class SparseKVCacheManager(KVCacheManager):
         self.video_indices = None
         self.text_indices = None
         torch.cuda.empty_cache()
+
+    def get_memory_stats(self) -> dict[str, int]:
+        """Return KV cache memory usage with video/text breakdown."""
+        video_bytes = 0
+        text_bytes = 0
+        kv_gpu = 0
+        kv_cpu = 0
+        for layer in self.layers:
+            if layer.video_keys is None:
+                continue
+            v_bytes = layer.video_keys.nbytes + layer.video_values.nbytes
+            t_bytes = layer.text_keys.nbytes + layer.text_values.nbytes
+            video_bytes += v_bytes
+            text_bytes += t_bytes
+            layer_bytes = v_bytes + t_bytes
+            if layer.video_keys.is_cuda:
+                kv_gpu += layer_bytes
+            else:
+                kv_cpu += layer_bytes
+
+        gpu_buffer = 0
+        if self._gpu_keys is not None:
+            gpu_buffer = self._gpu_keys.nbytes + self._gpu_values.nbytes
+
+        return {
+            "kv_cache_gpu_bytes": kv_gpu,
+            "kv_cache_cpu_bytes": kv_cpu,
+            "gpu_buffer_bytes": gpu_buffer,
+            "video_kv_bytes": video_bytes,
+            "text_kv_bytes": text_bytes,
+        }
