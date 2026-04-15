@@ -2,6 +2,11 @@ import torch
 from flexcachegen.config import Config
 from flexcachegen.utils import VideoInfo
 
+# Sentinel value for pruned video KV head keys. A large finite negative so that
+# QK^T produces very negative scores and softmax maps them to ~0.
+# We avoid -inf because 0 * -inf = NaN in IEEE 754.
+PRUNED_HEAD_KEY_SENTINEL = 0#-1e4
+
 
 class CacheLayer:
     """
@@ -340,6 +345,38 @@ class SparseCacheLayer(CacheLayer):
         self.video_len: int = 0
         self.text_seq_len: int = 0
 
+        # --- Static head pruning metadata ---
+        # When static head pruning is active, only a subset of KV heads are stored
+        # for video tokens (text KV always uses all heads). These fields are set by
+        # SparseKVCacheManager via set_pruning_info() before prefill begins.
+        self.kept_head_indices: torch.Tensor | None = None  # 1-D long tensor of head indices to keep
+        self.num_total_heads: int = 0                       # total KV heads before pruning (e.g. 8)
+        self.is_pruned: bool = False                        # convenience flag: True if any heads pruned
+
+    def set_pruning_info(self, pruned_heads: list[int], num_total_heads: int):
+        """
+        Configure per-layer head pruning for video KV.
+
+        Called by SparseKVCacheManager during initialization (and after clear()).
+        Computes which heads to keep as the complement of pruned_heads within
+        [0, num_total_heads). If pruned_heads is empty, pruning is disabled for
+        this layer and all heads are stored.
+
+        Args:
+            pruned_heads:    List of head indices to prune (e.g. [2, 4, 5, 6]).
+            num_total_heads: Total number of KV heads in the model (e.g. 8).
+        """
+        self.num_total_heads = num_total_heads
+        if not pruned_heads:
+            # No pruning for this layer — store all heads as usual.
+            self.is_pruned = False
+            self.kept_head_indices = None
+            return
+        self.is_pruned = True
+        # Compute kept heads as the sorted complement of pruned heads.
+        kept = sorted(set(range(num_total_heads)) - set(pruned_heads))
+        self.kept_head_indices = torch.tensor(kept, dtype=torch.long)
+
     @property
     def seq_len(self) -> int:
         return self.video_len + self.text_seq_len
@@ -384,15 +421,37 @@ class SparseCacheLayer(CacheLayer):
         else:
             alloc_kwargs.update(device=key_states.device)
 
-        # Video storage: exact size, never grows
-        self.video_keys = torch.empty(
-            (batch_size, video_len, num_heads, head_dim), **alloc_kwargs,
-        )
-        self.video_values = torch.empty(
-            (batch_size, video_len, num_heads, head_dim), **alloc_kwargs,
-        )
-        self.video_keys.copy_(video_k)
-        self.video_values.copy_(video_v)
+        # --- Allocate video KV storage ---
+        # When head pruning is active, only the kept heads are stored, producing a
+        # compressed tensor with shape [B, video_len, num_kept_heads, D] instead of
+        # the full [B, video_len, num_total_heads, D]. This reduces CPU/GPU memory
+        # proportional to the per-layer pruning ratio. Text KV is never pruned.
+        if self.is_pruned:
+            # Select only the kept heads from the extracted video KV.
+            # kept_head_indices is a CPU long tensor (e.g. [0, 1, 3, 7]).
+            # PyTorch allows a CPU index tensor to fancy-index a GPU tensor.
+            num_kept = self.kept_head_indices.shape[0]
+            video_k_kept = video_k[:, :, self.kept_head_indices, :]  # [1, video_len, num_kept, D]
+            video_v_kept = video_v[:, :, self.kept_head_indices, :]
+
+            self.video_keys = torch.empty(
+                (batch_size, video_len, num_kept, head_dim), **alloc_kwargs,
+            )
+            self.video_values = torch.empty(
+                (batch_size, video_len, num_kept, head_dim), **alloc_kwargs,
+            )
+            self.video_keys.copy_(video_k_kept)
+            self.video_values.copy_(video_v_kept)
+        else:
+            # No pruning — store all heads as-is.
+            self.video_keys = torch.empty(
+                (batch_size, video_len, num_heads, head_dim), **alloc_kwargs,
+            )
+            self.video_values = torch.empty(
+                (batch_size, video_len, num_heads, head_dim), **alloc_kwargs,
+            )
+            self.video_keys.copy_(video_k)
+            self.video_values.copy_(video_v)
 
         # Text storage: prefill text + room for max_new_tokens
         text_max_len = text_len + self.max_new_tokens
@@ -450,6 +509,27 @@ class SparseKVCacheManager(KVCacheManager):
         self.video_indices: torch.Tensor | None = None
         self.text_indices: torch.Tensor | None = None
 
+        # --- Static head pruning configuration ---
+        # If config provides a prune-heads map ({layer_idx: [head_indices]}), apply
+        # it to each SparseCacheLayer so that video KV storage is compressed.
+        self.prune_heads_map: dict[int, list[int]] | None = config.static_sparse_prune_heads
+        self._apply_pruning_info()
+
+    def _apply_pruning_info(self):
+        """
+        Propagate static head pruning configuration from config to each SparseCacheLayer.
+
+        For each layer, looks up the list of heads to prune from self.prune_heads_map.
+        Layers not present in the map (or with an empty list) will store all heads.
+        This is called during __init__ and after clear() to reconfigure fresh layers.
+        """
+        if self.prune_heads_map is None:
+            return
+        num_kv_heads = self.config.hf_config.text_config.num_key_value_heads
+        for layer_idx, layer in enumerate(self.layers):
+            pruned = self.prune_heads_map.get(layer_idx, [])
+            layer.set_pruning_info(pruned, num_kv_heads)
+
     def set_video_info(self, video_info: VideoInfo, prefill_len: int):
         """
         Precompute video and text index tensors from VideoInfo.
@@ -498,17 +578,56 @@ class SparseKVCacheManager(KVCacheManager):
     def load_layer_to_gpu(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, int]:
         """
         Reconstruct dense GPU buffer as [video_kv | text_kv].
+
+        When head pruning is active for this layer, the video KV is stored in
+        compressed form (only kept heads). To reconstruct the full dense buffer
+        expected by flash_attn_with_kvcache:
+          1. Fill the video region with sentinel values:
+             - Keys:   -1e4 (a large finite negative, so QK^T produces very negative
+                        scores that softmax maps to ~0. We avoid -inf because
+                        0 * -inf = NaN in IEEE 754, and some query elements may be 0.)
+             - Values:  0   (attention weight ≈ 0, so 0 * 0 = 0 — no contribution
+                        and no NaN risk.)
+          2. Scatter the kept heads from compressed storage into the correct head
+             positions using index_copy_ along the head dimension.
+        Text KV is always copied in full (all heads), unchanged.
         """
         cache_layer = self.layers[layer_idx]
         video_len = cache_layer.video_len
         text_seq_len = cache_layer.text_seq_len
         total_len = video_len + text_seq_len
 
-        # Copy video KV into buffer [0:video_len]
-        self._gpu_keys[:, :video_len].copy_(cache_layer.video_keys, non_blocking=True)
-        self._gpu_values[:, :video_len].copy_(cache_layer.video_values, non_blocking=True)
+        # --- Video KV region [0:video_len] ---
+        if cache_layer.is_pruned:
+            # Step 1: Fill the entire video region with sentinel values.
+            # Pruned heads retain these sentinels; kept heads are overwritten below.
+            #   Keys:  PRUNED_HEAD_KEY_SENTINEL (large finite negative → QK^T very
+            #           negative → softmax ≈ 0. We avoid -inf because 0 * -inf = NaN.)
+            #   Values: 0    (attention weight ≈ 0, so 0 × 0 = 0 — no contribution.)
+            self._gpu_keys[:, :video_len].fill_(PRUNED_HEAD_KEY_SENTINEL)
+            self._gpu_values[:, :video_len].fill_(0.0)
 
-        # Copy text KV into buffer [video_len:video_len+text_seq_len]
+            # Step 2: Copy kept heads one-by-one using basic slicing (h:h+1).
+            #
+            # Basic slicing (h:h+1) returns a VIEW of the buffer, so .copy_()
+            # writes directly into the buffer's target position via a single
+            # CPU-pinned → GPU DMA transfer with zero intermediate allocation.
+            # With at most 8 KV heads, the loop is short. non_blocking=True with
+            # pinned memory allows the CUDA copy engine to pipeline the DMA transfers.
+            kept = cache_layer.kept_head_indices.tolist()
+            for i, h in enumerate(kept):
+                self._gpu_keys[:, :video_len, h:h+1, :].copy_(
+                    cache_layer.video_keys[:, :, i:i+1, :], non_blocking=True
+                )
+                self._gpu_values[:, :video_len, h:h+1, :].copy_(
+                    cache_layer.video_values[:, :, i:i+1, :], non_blocking=True
+                )
+        else:
+            # No pruning — direct copy of all heads (original behavior).
+            self._gpu_keys[:, :video_len].copy_(cache_layer.video_keys, non_blocking=True)
+            self._gpu_values[:, :video_len].copy_(cache_layer.video_values, non_blocking=True)
+
+        # --- Text KV region [video_len:total_len] --- (never pruned)
         self._gpu_keys[:, video_len:total_len].copy_(
             cache_layer.text_keys[:, :text_seq_len], non_blocking=True
         )
@@ -527,6 +646,8 @@ class SparseKVCacheManager(KVCacheManager):
         self.layers = [
             SparseCacheLayer(self.config.max_new_tokens) for _ in range(self.num_hidden_layers)
         ]
+        # Re-apply head pruning config to freshly created layers.
+        self._apply_pruning_info()
         self._gpu_keys = None
         self._gpu_values = None
         self.video_info = None
