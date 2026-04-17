@@ -123,6 +123,9 @@ class Qwen3VLTextAttention(nn.Module):
             # GPU) to decouple storage format from compute format.
             k_cache, v_cache, cache_seqlens = kv_cache_manager.load_layer_to_gpu(self.layer_idx)
 
+            # Read block_table for paged attention (None when non-paged)
+            block_table = getattr(kv_cache_manager, 'block_table', None)
+
             # flash_attn_with_kvcache computes attention against cached KV and
             # writes the new token's k, v into the GPU buffer at position cache_seqlens
             attn_output = flash_attn_with_kvcache(
@@ -132,6 +135,7 @@ class Qwen3VLTextAttention(nn.Module):
                 k=k,
                 v=v,
                 cache_seqlens=cache_seqlens,
+                block_table=block_table,
                 causal=True,
             )
 
