@@ -118,6 +118,12 @@ class Qwen3VLTextAttention(nn.Module):
             attn_output = flash_attn_func(q, k, v, causal=True)
 
         else: # decoding stage
+            # Hand the current post-RoPE query to the sparse manager so it can
+            # run Quest page selection inside load_layer_to_gpu(). Duck-typed
+            # so the non-sparse KVCacheManager path is untouched.
+            if hasattr(kv_cache_manager, 'set_current_query'):
+                kv_cache_manager.set_current_query(q)
+
             # Copy this layer's KV from CacheLayer storage into the shared GPU
             # buffer. Always goes through the buffer (even when CacheLayer is on
             # GPU) to decouple storage format from compute format.

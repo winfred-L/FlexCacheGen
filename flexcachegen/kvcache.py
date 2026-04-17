@@ -5,7 +5,7 @@ from flexcachegen.utils import VideoInfo
 # Sentinel value for pruned video KV head keys. A large finite negative so that
 # QK^T produces very negative scores and softmax maps them to ~0.
 # We avoid -inf because 0 * -inf = NaN in IEEE 754.
-PRUNED_HEAD_KEY_SENTINEL = 0#-1e4
+PRUNED_HEAD_KEY_SENTINEL = -1e4
 
 
 class CacheLayer:
@@ -394,7 +394,11 @@ class SparseCacheLayer(CacheLayer):
 
     def _compute_page_metadata(self, video_keys_flat: torch.Tensor, video_len: int):
         """
-        Compute per-page min/max key metadata for future Quest scoring.
+        Compute per-page min/max key metadata for Quest criticality scoring.
+
+        Stored on the same device as video_keys_flat (GPU) so scoring can run
+        in a single GPU kernel per layer without CPU↔GPU ping-pong. Metadata
+        is small (num_pages × num_heads × head_dim × 2) — a few MB per layer.
 
         Args:
             video_keys_flat: [video_len, num_heads, head_dim] - video key tensor (on GPU)
@@ -402,9 +406,11 @@ class SparseCacheLayer(CacheLayer):
         """
         num_h = video_keys_flat.shape[1]
         head_dim = video_keys_flat.shape[2]
+        device = video_keys_flat.device
+        dtype = video_keys_flat.dtype
 
-        page_min = torch.empty(self.num_video_pages, num_h, head_dim, dtype=video_keys_flat.dtype)
-        page_max = torch.empty(self.num_video_pages, num_h, head_dim, dtype=video_keys_flat.dtype)
+        page_min = torch.empty(self.num_video_pages, num_h, head_dim, dtype=dtype, device=device)
+        page_max = torch.empty(self.num_video_pages, num_h, head_dim, dtype=dtype, device=device)
 
         full_pages = video_len // self.page_size
         remainder = video_len % self.page_size
@@ -421,9 +427,33 @@ class SparseCacheLayer(CacheLayer):
             page_min[full_pages] = last_data.amin(dim=0)
             page_max[full_pages] = last_data.amax(dim=0)
 
-        # Store on CPU (metadata is small, Quest scoring happens on CPU)
-        self.page_min_keys = page_min.cpu()
-        self.page_max_keys = page_max.cpu()
+        self.page_min_keys = page_min
+        self.page_max_keys = page_max
+
+    def quest_score_pages(self, q_kv: torch.Tensor) -> torch.Tensor:
+        """
+        Quest criticality score per video page — upper bound of sum_i q[i]·k[i].
+
+        For each dim: U_i = max(q[i]·m[i], q[i]·M[i]) ≥ q[i]·k[i] for any k in
+        the page (where m/M are this page's min/max). Summing U_i over the head
+        dim gives a per-head upper bound on Q·K for tokens in the page; summing
+        across heads gives a page-level score. Higher score → page more likely
+        to contain high-attention tokens.
+
+        Args:
+            q_kv: [num_heads, head_dim] — query already mapped to KV groups and
+                  restricted to this layer's kept heads, matching the head
+                  layout of page_min_keys / page_max_keys. Must live on the
+                  same device as the metadata.
+        Returns:
+            scores: [num_video_pages]
+        """
+        q = q_kv.unsqueeze(0)  # [1, H, D]
+        prod_min = q * self.page_min_keys  # [P, H, D]
+        prod_max = q * self.page_max_keys  # [P, H, D]
+        upper = torch.maximum(prod_min, prod_max)  # [P, H, D]
+        # sum over head_dim (per-head Q·K upper bound), then aggregate over heads
+        return upper.sum(dim=-1).sum(dim=-1)  # [P]
 
     def initialize_from_prefill(
         self,
@@ -612,6 +642,55 @@ class SparseKVCacheManager(KVCacheManager):
         self.prune_heads_map: dict[int, list[int]] | None = config.static_sparse_prune_heads
         self._apply_pruning_info()
 
+        # --- Quest (dynamic seq-dimension sparsity) ---
+        # Active iff dynamic_sparse_threshold is not None (== self.paged). The
+        # threshold is interpreted as the fraction of video pages to KEEP
+        # (higher = denser, 1.0 = load all, matching the non-Quest paged path).
+        # Set per-decode-step by Qwen3VLTextAttention via set_current_query().
+        self.num_q_heads: int = self.config.hf_config.text_config.num_attention_heads
+        self.num_kv_heads: int = self.config.hf_config.text_config.num_key_value_heads
+        self.current_query: torch.Tensor | None = None
+
+    def set_current_query(self, q: torch.Tensor):
+        """
+        Register the current decode-step query so the next load_layer_to_gpu()
+        can run Quest page selection. Called by Qwen3VLTextAttention before
+        each decode-step load. A no-op value (None) falls back to loading all
+        video pages in paged mode.
+
+        Args:
+            q: [1, 1, num_attention_heads, head_dim] — post-RoPE query for the
+               new token being decoded (on GPU).
+        """
+        self.current_query = q
+
+    def _map_q_to_kv_heads(self, q: torch.Tensor) -> torch.Tensor:
+        """
+        Aggregate multi-head Q into per-KV-head Q for Quest scoring.
+
+        GQA collapses a group of Q heads onto one shared KV head. We average
+        within each group so a single [num_kv_heads, head_dim] query represents
+        the group and can be matched against the per-KV-head page metadata.
+
+        Args:
+            q: [1, 1, num_q_heads, head_dim]
+        Returns:
+            [num_kv_heads, head_dim]
+        """
+        head_dim = q.shape[-1]
+        if self.num_q_heads == self.num_kv_heads:
+            return q.reshape(self.num_kv_heads, head_dim)
+        if self.num_q_heads % self.num_kv_heads == 0:
+            gqa_ratio = self.num_q_heads // self.num_kv_heads
+            return (
+                q.view(1, 1, self.num_kv_heads, gqa_ratio, head_dim)
+                 .mean(dim=3)
+                 .reshape(self.num_kv_heads, head_dim)
+            )
+        # Non-divisible ratio fallback: broadcast global Q mean to each KV head.
+        q_mean = q.mean(dim=2)  # [1, 1, head_dim]
+        return q_mean.expand(1, 1, self.num_kv_heads, head_dim).reshape(self.num_kv_heads, head_dim)
+
     def _apply_pruning_info(self):
         """
         Propagate static head pruning configuration from config to each SparseCacheLayer.
@@ -772,41 +851,94 @@ class SparseKVCacheManager(KVCacheManager):
         text_seq_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """
-        Paged path: populate paged GPU pool and build block_table.
+        Paged path with Quest query-aware page selection for the video region.
 
-        Layout: physical blocks [0..N-1] = video pages, [N..N+M-1] = text pages.
-        cache_seqlens = video_padded_len + text_seq_len (padding included).
+        Given the current decode query (set via set_current_query()), each call
+        scores the layer's video pages using the stored min/max key metadata,
+        keeps the Top-K pages (K = ceil(num_video_pages * threshold)), and loads
+        only those into the compact physical block prefix [0..K-1]. Text KV is
+        never sparsified — all text pages are loaded into their fixed physical
+        slots [num_video_pages..]. The block_table rewires logical pages so the
+        kernel sees Top-K video pages followed by text pages.
+
+        Fallback: if current_query is unset (non-decode call, or attention did
+        not populate it), load all video pages — behavior reduces to the
+        original paged path.
+
+        cache_seqlens = K * page_size + text_seq_len (K < num_video_pages under
+        Quest, == num_video_pages in fallback). Padding in the last video page
+        contributes keys=0 which yield softmax≈0 weight — same harmless effect
+        as in the non-Quest path.
         """
         num_video_pages = cache_layer.num_video_pages
         page_size = self.page_size
+        threshold = self.config.dynamic_sparse_threshold
 
-        # --- Video pages [block 0..num_video_pages-1] ---
+        # === Quest: select Top-K video pages for this layer's current Q ===
+        use_quest = (
+            num_video_pages > 0
+            and threshold is not None
+            and self.current_query is not None
+            and cache_layer.page_min_keys is not None
+        )
+        if use_quest:
+            top_k = max(1, min(num_video_pages, int(round(num_video_pages * threshold))))
+            if top_k < num_video_pages:
+                # Map Q heads → KV heads; restrict to kept heads to match metadata layout
+                q_kv_full = self._map_q_to_kv_heads(self.current_query)  # [num_kv_heads, D]
+                if cache_layer.is_pruned:
+                    kept_idx = cache_layer.kept_head_indices.to(q_kv_full.device)
+                    q_kv = q_kv_full.index_select(0, kept_idx)
+                else:
+                    q_kv = q_kv_full
+                q_kv = q_kv.to(dtype=cache_layer.page_min_keys.dtype)
+
+                scores = cache_layer.quest_score_pages(q_kv)                 # [num_video_pages]
+                selected_pages = torch.topk(scores, top_k).indices            # [top_k]
+                # Sort so physical block order follows original page order (slightly
+                # better locality for the kernel; also makes debugging easier).
+                selected_pages, _ = torch.sort(selected_pages)
+            else:
+                # threshold keeps everything — skip scoring
+                selected_pages = None
+                top_k = num_video_pages
+        else:
+            selected_pages = None
+            top_k = num_video_pages
+
+        num_video_blocks_used = top_k
+
+        # --- Gather source video pages from CacheLayer storage ---
+        if selected_pages is None:
+            src_k_view = cache_layer.video_paged_keys                        # [num_video_pages, S, H_stored, D]
+            src_v_view = cache_layer.video_paged_values
+        else:
+            sel_dev = selected_pages.to(cache_layer.video_paged_keys.device)
+            src_k_view = cache_layer.video_paged_keys.index_select(0, sel_dev)
+            src_v_view = cache_layer.video_paged_values.index_select(0, sel_dev)
+
+        # --- Load selected video pages into compact physical prefix [0..K-1] ---
+        # Reordering video pages is safe: RoPE is already baked into each K vector,
+        # so attention scores don't depend on the kernel's per-page traversal order.
         if cache_layer.is_pruned:
-            # Fill all video blocks with sentinels, then overwrite kept heads
-            self._gpu_paged_keys[:num_video_pages].fill_(PRUNED_HEAD_KEY_SENTINEL)
-            self._gpu_paged_values[:num_video_pages].fill_(0.0)
+            self._gpu_paged_keys[:num_video_blocks_used].fill_(PRUNED_HEAD_KEY_SENTINEL)
+            self._gpu_paged_values[:num_video_blocks_used].fill_(0.0)
 
             kept = cache_layer.kept_head_indices.tolist()
             for i, h in enumerate(kept):
-                self._gpu_paged_keys[:num_video_pages, :, h:h+1, :].copy_(
-                    cache_layer.video_paged_keys[:, :, i:i+1, :], non_blocking=True
+                self._gpu_paged_keys[:num_video_blocks_used, :, h:h+1, :].copy_(
+                    src_k_view[:, :, i:i+1, :], non_blocking=True
                 )
-                self._gpu_paged_values[:num_video_pages, :, h:h+1, :].copy_(
-                    cache_layer.video_paged_values[:, :, i:i+1, :], non_blocking=True
+                self._gpu_paged_values[:num_video_blocks_used, :, h:h+1, :].copy_(
+                    src_v_view[:, :, i:i+1, :], non_blocking=True
                 )
         else:
-            self._gpu_paged_keys[:num_video_pages].copy_(
-                cache_layer.video_paged_keys, non_blocking=True
-            )
-            self._gpu_paged_values[:num_video_pages].copy_(
-                cache_layer.video_paged_values, non_blocking=True
-            )
+            self._gpu_paged_keys[:num_video_blocks_used].copy_(src_k_view, non_blocking=True)
+            self._gpu_paged_values[:num_video_blocks_used].copy_(src_v_view, non_blocking=True)
 
-        # --- Text pages [block num_video_pages..] ---
+        # --- Text pages [block num_video_pages..] — always fully loaded ---
         if text_seq_len > 0:
-            # Copy text from continuous CPU storage to text pages in paged buffer.
-            # text_keys: [1, max_text_len, H, D] → squeeze batch → [max_text_len, H, D]
-            text_k = cache_layer.text_keys[0, :text_seq_len]   # [text_seq_len, H, D]
+            text_k = cache_layer.text_keys[0, :text_seq_len]
             text_v = cache_layer.text_values[0, :text_seq_len]
 
             num_text_pages_used = (text_seq_len + page_size - 1) // page_size
@@ -822,19 +954,27 @@ class SparseKVCacheManager(KVCacheManager):
                     text_v[t_start:t_end], non_blocking=True
                 )
 
-        # --- Build block table ---
-        # cache_seqlens = video_padded_len + text_seq_len
-        # The block table must cover pages 0..ceil(cache_seqlens / page_size),
-        # including the page where the new token will be written.
-        # Use a tensor (not int) for cache_seqlens in paged mode. flash_attn
-        # auto-expands int cache_seqlens to shape (k_cache.shape[0],) which is
-        # (total_blocks,) in paged mode — but the kernel expects (batch_size,).
-        seqlens_int = num_video_pages * page_size + text_seq_len
+        # --- Build block_table ---
+        # Logical pages: [0..K-1] = selected video pages (compact, physical 0..K-1),
+        #                [K..K+T]  = text pages (physical num_video_pages..).
+        # The page holding the new token (logical index K + text_seq_len//page_size)
+        # must be present so flash_attn can write into it — add it explicitly.
+        seqlens_int = num_video_blocks_used * page_size + text_seq_len
         cache_seqlens = torch.tensor(
             [seqlens_int], dtype=torch.int32, device=self.config.device,
         )
-        num_active_pages = seqlens_int // page_size + 1  # +1 for new token's page
-        self.block_table = self._block_table[:, :num_active_pages]
+
+        num_text_pages_ref = text_seq_len // page_size + 1  # +1 for new token's page
+        video_block_ids = torch.arange(
+            num_video_blocks_used, dtype=torch.int32, device=self.config.device,
+        )
+        text_block_ids = torch.arange(
+            num_video_pages,
+            num_video_pages + num_text_pages_ref,
+            dtype=torch.int32,
+            device=self.config.device,
+        )
+        self.block_table = torch.cat([video_block_ids, text_block_ids]).unsqueeze(0)  # [1, L]
 
         torch.cuda.current_stream().synchronize()
         return self._gpu_paged_keys, self._gpu_paged_values, cache_seqlens
@@ -883,6 +1023,7 @@ class SparseKVCacheManager(KVCacheManager):
         self.video_info = None
         self.video_indices = None
         self.text_indices = None
+        self.current_query = None
         torch.cuda.empty_cache()
 
     def get_memory_stats(self) -> dict[str, int]:
