@@ -65,7 +65,6 @@ class VLMEngine:
         ]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         images, videos, video_kwargs = process_vision_info(messages, image_patch_size=16, return_video_kwargs=True, return_video_metadata=True)
-        print(video_kwargs)
 
         # each video returns as (video_tensor, video_metadata)
         # split the videos and according metadatas
