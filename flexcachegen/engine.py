@@ -2,6 +2,7 @@ import torch
 from time import perf_counter
 
 from transformers import AutoProcessor
+from qwen_vl_utils import process_vision_info
 
 from flexcachegen.config import Config
 from flexcachegen.kvcache import KVCacheManager, SparseKVCacheManager
@@ -47,21 +48,69 @@ class VLMEngine:
                     {
                         "type": "video",
                         "video": video_path,
-                        "max_pixels": 360 * 420,
-                        "fps": 1.0,
+                        "resized_height": 16 * 32,  # VideoInfo.H_len=16
+                        "resized_width": 16 * 32,   # VideoInfo.W_len=16
+                        # restrict the resolution of individual frames in the video
+                        # "min_pixels": 275 * 32 * 32,
+                        # "max_pixels": 275 * 32 * 32,
+                        # limit the total number of tokens in the video
+                        # "total_pixels": 100 * 1024 * 32 * 32, # 64k tokens
+                        # accept either `fps` or `nframes`
+                        # "fps": 2.0,
+                        # "nframes": 32, #2048,
                     },
                     {"type": "text", "text": question},
                 ],
             }
         ]
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt"
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        images, videos, video_kwargs = process_vision_info(messages, image_patch_size=16, return_video_kwargs=True, return_video_metadata=True)
+        print(video_kwargs)
+
+        # each video returns as (video_tensor, video_metadata)
+        # split the videos and according metadatas
+        if videos is not None:
+            videos, video_metadatas = zip(*videos)
+            videos, video_metadatas = list(videos), list(video_metadatas)
+        else:
+            video_metadatas = None
+        
+        inputs = self.processor(
+            text=text,
+            images=images,
+            videos=videos,
+            video_metadata=video_metadatas,
+            return_tensors="pt",
+            do_resize=False, # avoid duplicate resizing
+            **video_kwargs
         )
         return inputs
+
+        ### 注：processor.apply_chat_template走的是hf的实现，不支持resized_height/resized_width, 只支持smart resize
+        # messages = [
+        #     {
+        #         "role": "user",
+        #         "content": [
+        #             {
+        #                 "type": "video",
+        #                 "video": video_path,
+        #                 "resized_height": 16 * 32,
+        #                 "resized_width": 16 * 32,
+        #                 # "max_pixels": 360 * 420,
+        #                 # "fps": 1.0,
+        #             },
+        #             {"type": "text", "text": question},
+        #         ],
+        #     }
+        # ]
+        # inputs = self.processor.apply_chat_template(
+        #     messages,
+        #     tokenize=True,
+        #     add_generation_prompt=True,
+        #     return_dict=True,
+        #     return_tensors="pt"
+        # )
+        # return inputs
 
     
     def is_finished(self, output_ids: list[int]) -> bool:
