@@ -5,7 +5,7 @@ from flexcachegen.utils import VideoInfo
 # Sentinel value for pruned video KV head keys. A large finite negative so that
 # QK^T produces very negative scores and softmax maps them to ~0.
 # We avoid -inf because 0 * -inf = NaN in IEEE 754.
-PRUNED_HEAD_KEY_SENTINEL = -1e4
+PRUNED_HEAD_KEY_SENTINEL = 0.0 #-1e4
 
 
 class CacheLayer:
@@ -889,8 +889,10 @@ class SparseKVCacheManager(KVCacheManager):
 
         if cache_layer.is_pruned:
             # src_k shape: [top_k, page_size, H_stored, D]
-            # Flatten to [top_k * page_size, H_stored, D], then scatter into buffer
-            # at positions of kept heads (pruned positions already filled with sentinel).
+            # Fill all positions with sentinel first, then scatter kept heads into their slots.
+            # This ensures pruned head positions hold PRUNED_HEAD_KEY_SENTINEL (not garbage).
+            self._gpu_keys[:, :video_tokens_used].fill_(PRUNED_HEAD_KEY_SENTINEL)
+            self._gpu_values[:, :video_tokens_used].fill_(0.0)
             num_h_stored = src_k.shape[2]
             src_k_flat = src_k.reshape(top_k * page_size, num_h_stored, src_k.shape[3])
             src_v_flat = src_v.reshape(top_k * page_size, num_h_stored, src_v.shape[3])
