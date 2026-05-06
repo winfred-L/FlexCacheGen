@@ -46,13 +46,13 @@ class Config:
     sparse_kv: bool = True
         # True: split video/text KV cache storage, use `SparseKVCacheManager`
         # False: use `KVCacheManager`
-    static_sparse_threshold: str | None = '0.1'
+    static_sparse_threshold: str | None = None#'0.1'
         # if not None, apply static sparsity with the given threshold
         # (e.g., '0.2' means pruning heads with visual score less than 0.2)
     static_sparse_prune_heads: dict[int, list[int]] | None = None  # {layer_idx: [head_indices]}
         # inferred from `static_sparse_threshold` when initialized
     
-    dynamic_sparse_threshold: float | None = 0.5  # TODO
+    dynamic_sparse_threshold: float | None = None  # TODO
     page_size: int = 256  # FA2 paged attention block size (must be multiple of 256)
 
 

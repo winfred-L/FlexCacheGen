@@ -59,7 +59,7 @@ conda install "ffmpeg"
 pip install torchcodec --index-url https://download.pytorch.org/whl/cu130
 
 # install other packages
-pip install -e .
+pip install -e . # -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 ### Run Example
@@ -76,8 +76,12 @@ python ./scripts/example.sh
 modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir /path/to/models/Qwen3-VL-8B-Instruct
 modelscope download --model ZhipuAI/GLM-4.6V-Flash --local_dir /path/to/models/GLM-4.6V-Flash
 
-# MLVU summary
-modelscope download --dataset AI-ModelScope/MLVU --local_dir /path/to/datasets/MLVU --include 'MLVU/json/9_summary/*'
+# MLVU Sub-Scene Captioning
+modelscope download --dataset AI-ModelScope/MLVU --local_dir /path/to/datasets/MLVU --include 'MLVU/json/8_sub_scene.json'
+modelscope download --dataset AI-ModelScope/MLVU --local_dir /path/to/datasets/MLVU --include 'MLVU/video/8_sub_scene/*'
+
+# MLVU Summary
+modelscope download --dataset AI-ModelScope/MLVU --local_dir /path/to/datasets/MLVU --include 'MLVU/json/9_summary.json'
 modelscope download --dataset AI-ModelScope/MLVU --local_dir /path/to/datasets/MLVU --include 'MLVU/video/9_summary/*'
 ```
 

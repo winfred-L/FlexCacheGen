@@ -14,10 +14,11 @@ dependencies = [
     "flash-attn>=2.8.3",
     "transformers>=4.57.3",
     "qwen_vl_utils",
-    "triton",
-    "xxhash",
+    #"triton",
+    #"xxhash",
     "openai",
-    "dotenv",
+    "bert_score",
+    "rouge_score",
 ]
 
 [tool.setuptools.packages.find]
