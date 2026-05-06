@@ -19,7 +19,7 @@ class VLMEngine:
     def __init__(self, model_type='qwen3vl-8b', **kwargs):
         t_init = perf_counter()
         # config
-        self.config = Config(model_type)
+        self.config = Config(model_type, **kwargs)
         # kv cache manager
         if self.config.sparse_kv:
             self.kv_cache_manager = SparseKVCacheManager(self.config)

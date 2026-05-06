@@ -67,6 +67,11 @@ class Config:
         self.eos_token_id = (151645, 151643)
         self.spatial_merge_size = 2
 
+        if 'static_sparse_threshold' in kwargs:
+            self.static_sparse_threshold = kwargs.pop('static_sparse_threshold')
+        if 'dynamic_sparse_threshold' in kwargs:
+            self.dynamic_sparse_threshold = kwargs.pop('dynamic_sparse_threshold')
+
         if self.static_sparse_threshold is not None:
             if self.static_sparse_threshold not in pruning_heads_list:
                 raise ValueError(f"Unknown static_sparse_threshold '{self.static_sparse_threshold}'. Available: {list(pruning_heads_list.keys())}")

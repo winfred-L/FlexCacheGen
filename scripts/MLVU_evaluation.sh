@@ -6,7 +6,7 @@ export API_KEY="sk-JZTZcaSrvIvSQUpdnVCUyVTOzCLBSSVyxF0wbkUfDzFaKVTz"
 # ========== config ==========
 
 TASK="8_sub_scene"    # 8_sub_scene / 9_summary
-METRICS="all"     # gpt / bert / rouge / all / "gpt bert rouge"
+METRICS="all"     # gpt / bert / rouge / all / "bert rouge"
 
 PRED_DIR="/data1/lyc/flexcachegen_outputs/pred"
 PRED_FILE_NAMES=(
@@ -18,7 +18,7 @@ OUTPUT_DIR="/data1/lyc/flexcachegen_outputs/acc"
 
 mkdir -p "${OUTPUT_DIR}"
 
-python "./test/MLVU/evaluation.py" \
+python3 "./test/MLVU/evaluation.py" \
   --task "${TASK}" \
   --metrics ${METRICS} \
   --pred-dir "${PRED_DIR}" \

@@ -17,8 +17,15 @@ import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
-
 from tqdm import tqdm
+import logging
+import warnings
+
+# Suppress BERT HuggingFace Transformers warnings
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+logging.getLogger("transformers").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore")
 
 
 # GPT client is initialized lazily only when GPT metric is requested.
@@ -407,24 +414,41 @@ def annotate_bert(
     local_model_path: str = DEFAULT_BERT_LOCAL_MODEL_PATH,
     model_id: str = DEFAULT_BERT_MODEL_ID,
     num_layers: int = 17,
+    max_tokens: int = 500,
 ):
     from bert_score import score
+    from transformers import AutoTokenizer
 
     model_path = ensure_bert_model_from_modelscope(
         local_model_path=local_model_path,
         model_id=model_id,
     )
 
-    _, _, F1 = score(
-        preds,
-        refs,
-        model_type=model_path,
-        num_layers=num_layers,
-        verbose=False,
-        rescale_with_baseline=False,
-    )
+    # Load tokenizer for truncation
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
 
-    return F1.tolist(), F1.mean().item()
+    # Truncate texts using tokenizer to ensure we stay under model's max length
+    def truncate(text: str, max_tokens: int = 500) -> str:
+        enc = tokenizer(text, return_tensors='pt', truncation=True, max_length=max_tokens)
+        return tokenizer.decode(enc['input_ids'][0], skip_special_tokens=True)
+
+    # Process one at a time to avoid sequence length mismatches
+    f1_list = []
+    for ref, pred in tqdm(zip(refs, preds), desc="bert", total=len(refs)):
+        ref_trunc = truncate(ref, max_tokens=max_tokens)
+        pred_trunc = truncate(pred, max_tokens=max_tokens)
+        _, _, F1 = score(
+            [pred_trunc],
+            [ref_trunc],
+            model_type=model_path,
+            num_layers=num_layers,
+            verbose=False,
+            rescale_with_baseline=False,
+            batch_size=1,
+        )
+        f1_list.append(F1.item())
+
+    return f1_list, sum(f1_list) / len(f1_list)
 
 
 def evaluate_bert(
