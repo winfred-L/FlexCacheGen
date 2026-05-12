@@ -40,7 +40,7 @@ class Config:
     device = torch.device('cuda:0')
 
     # kv cache settings
-    offload_kv_to_cpu: bool = False
+    offload_kv_to_cpu: bool = True
         # True: KV on CPU pinned memory
         # False: KV on GPU (but gpu kv buffer still in use)
     sparse_kv: bool = True
@@ -52,10 +52,14 @@ class Config:
     static_sparse_prune_heads: dict[int, list[int]] | None = None  # {layer_idx: [head_indices]}
         # inferred from `static_sparse_threshold` when initialized
     
-    dynamic_sparse_threshold: float | None = None  # TODO
+    dynamic_sparse_threshold: float | None = 0.1  # TODO
     page_size: int = 256  # FA2 paged attention block size (must be multiple of 256)
 
-
+    # Pipeline: overlap attention computation with KV prefetch (decode only)
+    pipeline: bool = False
+        # True:  overlap layer-L attention with layer-(L+1) KV prefetch
+        #        requires dynamic_sparse_threshold (Quest) for page prediction
+        # False: sequential decode (default)
 
     def __init__(self, model_type: str = 'qwen3vl-8b', **kwargs):
         if model_type not in MODEL_REGISTRY:
@@ -71,6 +75,13 @@ class Config:
             self.static_sparse_threshold = kwargs.pop('static_sparse_threshold')
         if 'dynamic_sparse_threshold' in kwargs:
             self.dynamic_sparse_threshold = kwargs.pop('dynamic_sparse_threshold')
+        if 'pipeline' in kwargs:
+            self.pipeline = kwargs.pop('pipeline')
+
+        if self.pipeline and self.dynamic_sparse_threshold is None:
+            raise ValueError('Dynamic sparse threshold is required for pipeline')
+        if self.pipeline and self.offload_kv_to_cpu is False:
+            raise ValueError('Offloading KV to CPU is required for pipeline')
 
         if self.static_sparse_threshold is not None:
             if self.static_sparse_threshold not in pruning_heads_list:
@@ -94,4 +105,5 @@ class Config:
             print(f"    Pruning {total_pruned}/{total_heads} heads ({total_pruned/total_heads:.1%} sparsity)")
         if self.dynamic_sparse_threshold is not None:
             print(f"  Dynamic sparse threshold: {self.dynamic_sparse_threshold}")
+        print(f"Pipeline:           ", self.pipeline)
         print("="*50)

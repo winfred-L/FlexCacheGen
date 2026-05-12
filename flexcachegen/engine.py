@@ -25,6 +25,9 @@ class VLMEngine:
             self.kv_cache_manager = SparseKVCacheManager(self.config)
         else:
             self.kv_cache_manager = KVCacheManager(self.config)
+        # Enable pipeline on the sparse manager if configured
+        if self.config.pipeline and isinstance(self.kv_cache_manager, SparseKVCacheManager):
+            self.kv_cache_manager.enable_pipeline()
         # model
         self.model = Qwen3VLModel(self.config, self.kv_cache_manager).to(self.config.device)
         self.processor = AutoProcessor.from_pretrained(self.config.model_path, use_fast=True)
@@ -134,6 +137,59 @@ class VLMEngine:
         token_id, logits = self.model.output_head(hidden_states)
         return token_id, logits
 
+    def decoding_pipeline(self, token_id: int, cur_pos_idx: int):
+        """Pipeline decode: overlap attention computation with KV prefetch.
+
+        After computing Q for layer L, starts async prefetch of layer (L+1)'s
+        KV using Q_L for Quest page selection. While the prefetch runs on a
+        dedicated CUDA stream, layer L's flash_attn + MLP runs on the default
+        stream. Uses ping-pong dual GPU buffers (slot 0 and slot 1).
+
+        Layer 0 has no prior Q, so its KV is loaded synchronously before
+        the loop begins.
+        """
+        hidden_states = self.model.text_embed(token_id)
+        self.model.set_rotary_pos_emb(hidden_states, cur_pos_idx)
+        mgr = self.kv_cache_manager
+        current_slot = 0
+
+        # Layer 0: sync load (no prior Q for prefetch)
+        mgr.load_layer_to_gpu_pipeline(0, slot=0)
+
+        for layer_idx in range(self.num_hidden_layers):
+            attn = self.model.language_model.layers[layer_idx].self_attn
+
+            # Step 1: Compute Q, K, V
+            q, k, v, residual = attn.forward_decode_qkv(
+                hidden_states, self.model.position_embeddings
+            )
+
+            # Step 2: Start async prefetch for next layer using current Q
+            if layer_idx < self.num_hidden_layers - 1:
+                next_slot = 1 - current_slot
+                mgr.start_prefetch(layer_idx + 1, q, slot=next_slot)
+
+            # Step 3: Run attention on current buffer
+            k_cache, v_cache, cache_seqlens = mgr.get_buffer(current_slot)
+            # Expose current slot to attention so offload can find the right buffer
+            mgr._current_pipeline_slot = current_slot
+            hidden_states = attn.forward_decode_attn_output(
+                q, k, v, residual, k_cache, v_cache, cache_seqlens, mgr
+            )
+
+            # Step 4: MLP (runs on default stream, overlaps with prefetch on
+            # the prefetch stream)
+            hidden_states = self.model.mlp(hidden_states, layer_idx)
+
+            # Step 5: Wait for prefetch to complete before next iteration
+            # (after MLP so MLP overlaps with the tail of the prefetch)
+            if layer_idx < self.num_hidden_layers - 1:
+                mgr.wait_prefetch()
+                current_slot = 1 - current_slot
+
+        token_id, logits = self.model.output_head(hidden_states)
+        return token_id, logits
+
 
     @torch.inference_mode()
     def generate_single(self, video_path: str, question: str):
@@ -160,6 +216,49 @@ class VLMEngine:
         while not self.is_finished(output_ids):
             cur_pos_idx = prompt_len + len(output_ids) - 1
             token_id, logits = self.decoding(token_id, cur_pos_idx)
+            output_ids.append(token_id)
+
+        # 5. clean up kv cache
+        self.kv_cache_manager.clear()
+
+        # 6. decode output text
+        output_text = self.processor.batch_decode(
+            [output_ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+
+        return output_text
+
+    @torch.inference_mode()
+    def generate_single_pipeline(self, video_path: str, question: str):
+        """Generate with pipeline-overlapped decode (attention || KV prefetch).
+
+        Same as generate_single but uses decoding_pipeline which overlaps
+        each layer's attention computation with the next layer's KV cache
+        prefetch on a dedicated CUDA stream. Requires dynamic_sparse_threshold
+        (Quest) — enforced by Config validation.
+        """
+        output_ids = []
+
+        # 1. process input
+        inputs = self.process_input(video_path, question)
+        inputs = inputs.to(self.config.device)
+        prompt_len = inputs["input_ids"].shape[1]
+
+        if isinstance(self.kv_cache_manager, SparseKVCacheManager):
+            video_info = self.model.get_video_info(inputs)
+            self.kv_cache_manager.set_video_info(video_info, prompt_len)
+
+        # 2. encoding stage
+        hidden_states = self.model.encoding(inputs)
+
+        # 3. prefill stage (same as non-pipeline)
+        token_id, logits = self.prefill(hidden_states)
+        output_ids.append(token_id)
+
+        # 4. decoding stage (pipeline)
+        while not self.is_finished(output_ids):
+            cur_pos_idx = prompt_len + len(output_ids) - 1
+            token_id, logits = self.decoding_pipeline(token_id, cur_pos_idx)
             output_ids.append(token_id)
 
         # 5. clean up kv cache

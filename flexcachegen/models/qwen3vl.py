@@ -152,6 +152,107 @@ class Qwen3VLTextAttention(nn.Module):
         hidden_states = residual + attn_output
         return hidden_states
 
+    def forward_decode_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute Q, K, V with layernorm, norm, and RoPE for pipeline decode.
+
+        Splits the decode forward at the point where Q is available,
+        allowing the caller to start async KV prefetch using Q before
+        continuing with attention.
+
+        Args:
+            hidden_states:      [1, 1, hidden_size]
+            position_embeddings: (cos, sin) for RoPE
+
+        Returns:
+            (q, k, v, residual):
+              - q: [1, 1, num_attention_heads, head_dim] post-RoPE
+              - k: [1, 1, num_kv_heads, head_dim] post-RoPE
+              - v: [1, 1, num_kv_heads, head_dim]
+              - residual: [1, 1, hidden_size]
+        """
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        q = q.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        cos, sin = position_embeddings
+        q, k = self.apply_rotary_pos_emb(q, k, cos, sin)
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+
+        return q, k, v, residual
+
+    def forward_decode_attn_output(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        residual: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cache_seqlens: int,
+        kv_cache_manager: KVCacheManager,
+    ) -> torch.Tensor:
+        """Run flash_attn and output projection for pipeline decode.
+
+        Called after QKV computation and KV buffer prefetch. The KV buffer
+        is already loaded by the pipeline logic, so this method only runs
+        attention and the output projection.
+
+        Args:
+            q:              [1, 1, num_attention_heads, head_dim]
+            k:              [1, 1, num_kv_heads, head_dim]
+            v:              [1, 1, num_kv_heads, head_dim]
+            residual:       [1, 1, hidden_size]
+            k_cache:        GPU buffer keys
+            v_cache:        GPU buffer values
+            cache_seqlens:  valid KV length in the buffer
+            kv_cache_manager: for offload_after_decode_pipeline
+
+        Returns:
+            hidden_states: [1, 1, hidden_size]
+        """
+        batch_size, seq_len, _ = residual.shape
+
+        attn_output = flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=k,
+            v=v,
+            cache_seqlens=cache_seqlens,
+            causal=True,
+        )
+
+        # Sync new token's KV back to CacheLayer storage
+        if hasattr(kv_cache_manager, 'offload_after_decode_pipeline'):
+            kv_cache_manager.offload_after_decode_pipeline(
+                self.layer_idx, kv_cache_manager._current_pipeline_slot)
+        else:
+            kv_cache_manager.offload_after_decode(self.layer_idx)
+
+        attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+
+        hidden_states = residual + attn_output
+        return hidden_states
+
 
 class Qwen3VLTextMLP(nn.Module):
     def __init__(self, config: Config):

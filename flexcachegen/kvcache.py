@@ -393,17 +393,21 @@ class SparseCacheLayer(CacheLayer):
     def seq_len(self) -> int:
         return self.video_len + self.text_seq_len
 
-    def _compute_page_metadata(self, video_keys_flat: torch.Tensor, video_len: int):
+    def _compute_page_metadata(self, video_keys_flat: torch.Tensor, video_len: int,
+                               store_on_cpu: bool = False):
         """
         Compute per-page min/max key metadata for Quest criticality scoring.
 
-        Stored on the same device as video_keys_flat (GPU) so scoring can run
-        in a single GPU kernel per layer without CPU↔GPU ping-pong. Metadata
-        is small (num_pages × num_heads × head_dim × 2) — a few MB per layer.
+        When store_on_cpu is True (CPU offloading mode), metadata is stored on
+        CPU pinned memory so Quest scoring can run entirely on CPU — avoiding the
+        GPU→CPU sync that would otherwise be needed to transfer selected page
+        indices back for CPU-side index_select. Metadata is small
+        (num_pages × num_heads × head_dim × 2) — a few MB per layer.
 
         Args:
             video_keys_flat: [video_len, num_heads, head_dim] - video key tensor (on GPU)
             video_len:       actual number of valid video tokens (excludes padding)
+            store_on_cpu:    If True, store metadata on CPU pinned memory
         """
         num_h = video_keys_flat.shape[1]
         head_dim = video_keys_flat.shape[2]
@@ -427,6 +431,11 @@ class SparseCacheLayer(CacheLayer):
             last_data = video_keys_flat[full_pages * self.page_size:video_len]
             page_min[full_pages] = last_data.amin(dim=0)
             page_max[full_pages] = last_data.amax(dim=0)
+
+        # Store on CPU pinned memory when offloading — avoids GPU→CPU sync during decode
+        if store_on_cpu:
+            page_min = page_min.cpu().pin_memory()
+            page_max = page_max.cpu().pin_memory()
 
         self.page_min_keys = page_min
         self.page_max_keys = page_max
@@ -463,6 +472,7 @@ class SparseCacheLayer(CacheLayer):
         offload: bool = True,
         video_indices: torch.Tensor | None = None,
         text_indices: torch.Tensor | None = None,
+        store_metadata_on_cpu: bool = False,
     ):
         """
         Split prefill KV into video and text parts and store separately.
@@ -527,7 +537,7 @@ class SparseCacheLayer(CacheLayer):
             vv = video_v_kept.squeeze(0)
 
             # Compute page metadata BEFORE padding (only valid tokens)
-            self._compute_page_metadata(vk, video_len)
+            self._compute_page_metadata(vk, video_len, store_on_cpu=store_metadata_on_cpu)
 
             # Pad to page boundary and reshape to [num_pages, page_size, H, D]
             if padded_len > video_len:
@@ -641,6 +651,25 @@ class SparseKVCacheManager(KVCacheManager):
         self.num_kv_heads: int = self.config.hf_config.text_config.num_key_value_heads
         self.current_query: torch.Tensor | None = None
 
+        # --- Pipeline: overlap attention with KV prefetch ---
+        # Active iff config.pipeline is True (requires dynamic_sparse_threshold).
+        # Uses dual GPU buffers (ping-pong) and a dedicated CUDA stream for
+        # async DMA transfers. After computing Q for layer L, the pipeline
+        # starts prefetching layer (L+1)'s KV on the prefetch stream while
+        # layer L's attention+MLP runs on the default stream.
+        self._pipeline: bool = False
+        self._gpu_keys_alt: torch.Tensor | None = None
+        self._gpu_values_alt: torch.Tensor | None = None
+        self._prefetch_stream: torch.cuda.Stream | None = None
+        self._q_ready_event: torch.cuda.Event | None = None
+        self._current_pipeline_slot: int = 0  # set by decoding_pipeline per layer
+        # Per-slot state: tracks buffer layout for offload_after_decode_pipeline
+        # slot 0 = primary buffer, slot 1 = alt buffer
+        self._slot_info: list[dict] = [
+            {"cache_seqlens": 0, "video_tokens_used": 0},
+            {"cache_seqlens": 0, "video_tokens_used": 0},
+        ]
+
     def set_current_query(self, q: torch.Tensor):
         """
         Register the current decode-step query so the next load_layer_to_gpu()
@@ -722,6 +751,17 @@ class SparseKVCacheManager(KVCacheManager):
             device=self.config.device, dtype=dtype,
         )
 
+        # Pipeline: allocate second buffer pair for ping-pong overlap
+        if self._pipeline and self._gpu_keys_alt is None:
+            self._gpu_keys_alt = torch.empty(
+                (batch_size, max_seq_len, num_heads, head_dim),
+                device=self.config.device, dtype=dtype,
+            )
+            self._gpu_values_alt = torch.empty(
+                (batch_size, max_seq_len, num_heads, head_dim),
+                device=self.config.device, dtype=dtype,
+            )
+
     def set_video_info(self, video_info: VideoInfo, prefill_len: int):
         """
         Precompute video and text index tensors from VideoInfo.
@@ -755,6 +795,7 @@ class SparseKVCacheManager(KVCacheManager):
             offload=self.offload,
             video_indices=self.video_indices,
             text_indices=self.text_indices,
+            store_metadata_on_cpu=self.offload,  # CPU metadata when offloading avoids GPU→CPU sync
         )
 
         # Lazy-allocate shared GPU buffer (same as parent)
@@ -781,7 +822,8 @@ class SparseKVCacheManager(KVCacheManager):
         if not self.paged:
             return self._load_layer_continuous(cache_layer, video_len, text_seq_len)
         else:
-            return self._load_layer_quest(cache_layer, video_len, text_seq_len)
+            keys, values, total_len, _ = self._load_layer_quest(cache_layer, video_len, text_seq_len)
+            return keys, values, total_len
 
     def _load_layer_continuous(
         self,
@@ -825,20 +867,41 @@ class SparseKVCacheManager(KVCacheManager):
         cache_layer: SparseCacheLayer,
         video_len: int,
         text_seq_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        target_keys: torch.Tensor | None = None,
+        target_values: torch.Tensor | None = None,
+        sync: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
         """
         Quest + contiguous buffer path.
 
+        When page_min_keys is on CPU (offload mode), Quest scoring runs entirely
+        on CPU — avoiding the GPU→CPU sync that GPU-side scoring would require
+        to transfer selected page indices back. The Q vector is tiny (a few KB)
+        so moving it to CPU is negligible.
+
+        Video KV pages are gathered into a CPU pinned staging buffer before DMA
+        to ensure truly asynchronous CPU→GPU transfer (non-pinned source would
+        force synchronous memcpy).
+
         GPU buffer layout:
         - Quest selected (top_k < num_video_pages): [top_k*page_size video tokens | text_seq_len tokens]
-          video region gathers selected pages; unselected pages' KV are not in the buffer
         - All kept (top_k >= num_video_pages): [video_len video tokens | text_seq_len tokens]
-          identical to the continuous path
         - cache_seqlens = video_tokens_used + text_seq_len
 
-        Correctness: unselected video pages are not in the buffer (buffer only has top_k pages).
-        During attention these positions have K=0 → QK^T=0 → softmax≈0 → equivalent to not participating.
+        Args:
+            target_keys:   GPU buffer to write into (defaults to self._gpu_keys)
+            target_values: GPU buffer to write into (defaults to self._gpu_values)
+            sync:          If True, synchronize current stream after copy (default).
+                           Set False for pipeline async prefetch; caller handles sync.
+
+        Returns:
+            (target_keys, target_values, total_len, video_tokens_used)
         """
+        if target_keys is None:
+            target_keys = self._gpu_keys
+        if target_values is None:
+            target_values = self._gpu_values
+
         num_video_pages = cache_layer.num_video_pages
         page_size = self.page_size
         threshold = self.config.dynamic_sparse_threshold
@@ -854,23 +917,33 @@ class SparseKVCacheManager(KVCacheManager):
             top_k = max(1, min(num_video_pages,
                         int(round(num_video_pages * threshold))))
             if top_k < num_video_pages:
-                # Quest selection: gather selected pages
-                q_kv_full = self._map_q_to_kv_heads(self.current_query)
-                if cache_layer.is_pruned:
-                    kept_idx = cache_layer.kept_head_indices.to(q_kv_full.device)
-                    q_kv = q_kv_full.index_select(0, kept_idx)
+                if cache_layer.page_min_keys.is_cuda:
+                    # GPU-side Quest scoring (when metadata is on GPU)
+                    q_kv_full = self._map_q_to_kv_heads(self.current_query)
+                    if cache_layer.is_pruned:
+                        kept_idx = cache_layer.kept_head_indices.to(q_kv_full.device)
+                        q_kv = q_kv_full.index_select(0, kept_idx)
+                    else:
+                        q_kv = q_kv_full
+                    q_kv = q_kv.to(dtype=cache_layer.page_min_keys.dtype)
+                    scores = cache_layer.quest_score_pages(q_kv)
+                    selected_pages = torch.topk(scores, top_k).indices
+                    selected_pages, _ = torch.sort(selected_pages)
+                    selected_pages = selected_pages.to(device='cpu')
                 else:
-                    q_kv = q_kv_full
-                q_kv = q_kv.to(dtype=cache_layer.page_min_keys.dtype)
-                scores = cache_layer.quest_score_pages(q_kv)
-                selected_pages = torch.topk(scores, top_k).indices
-                selected_pages, _ = torch.sort(selected_pages)
-                video_tokens_used = top_k * page_size  # Quest compression: smaller than video_len
+                    # CPU-side Quest scoring (when metadata is on CPU — avoids GPU→CPU sync)
+                    q_kv_full = self._map_q_to_kv_heads(self.current_query)
+                    q_kv_cpu = q_kv_full.to(device='cpu', dtype=cache_layer.page_min_keys.dtype)
+                    if cache_layer.is_pruned:
+                        kept_idx = cache_layer.kept_head_indices
+                        q_kv_cpu = q_kv_cpu.index_select(0, kept_idx)
+                    scores = cache_layer.quest_score_pages(q_kv_cpu)
+                    selected_pages, _ = torch.sort(torch.topk(scores, top_k).indices)
+                video_tokens_used = top_k * page_size
             else:
-                # top_k >= num_video_pages: keep all, same as continuous path
                 selected_pages = None
                 top_k = num_video_pages
-                video_tokens_used = cache_layer.video_len  # no padding, same as continuous path
+                video_tokens_used = cache_layer.video_len
         else:
             selected_pages = None
             top_k = num_video_pages
@@ -880,45 +953,68 @@ class SparseKVCacheManager(KVCacheManager):
 
         # === Build contiguous video region ===
         if selected_pages is None:
+            # All pages kept — single contiguous DMA from pinned memory
             src_k = cache_layer.video_paged_keys
             src_v = cache_layer.video_paged_values
-        else:
-            sel_dev = selected_pages.to(cache_layer.video_paged_keys.device)
-            src_k = cache_layer.video_paged_keys.index_select(0, sel_dev)
-            src_v = cache_layer.video_paged_values.index_select(0, sel_dev)
 
-        if cache_layer.is_pruned:
-            # src_k shape: [top_k, page_size, H_stored, D]
-            # Fill all positions with sentinel first, then scatter kept heads into their slots.
-            # This ensures pruned head positions hold PRUNED_HEAD_KEY_SENTINEL (not garbage).
-            self._gpu_keys[:, :video_tokens_used].fill_(PRUNED_HEAD_KEY_SENTINEL)
-            self._gpu_values[:, :video_tokens_used].fill_(0.0)
-            num_h_stored = src_k.shape[2]
-            src_k_flat = src_k.reshape(top_k * page_size, num_h_stored, src_k.shape[3])
-            src_v_flat = src_v.reshape(top_k * page_size, num_h_stored, src_v.shape[3])
-            kept = cache_layer.kept_head_indices.tolist()
-            for i, h in enumerate(kept):
-                self._gpu_keys[:, :video_tokens_used, h:h+1, :].copy_(
-                    src_k_flat[:, i:i+1, :], non_blocking=True)
-                self._gpu_values[:, :video_tokens_used, h:h+1, :].copy_(
-                    src_v_flat[:, i:i+1, :], non_blocking=True)
+            if cache_layer.is_pruned:
+                target_keys[:, :video_tokens_used].fill_(PRUNED_HEAD_KEY_SENTINEL)
+                target_values[:, :video_tokens_used].fill_(0.0)
+                num_h_stored = src_k.shape[2]
+                src_k_flat = src_k.reshape(num_video_pages * page_size, num_h_stored, src_k.shape[3])
+                src_v_flat = src_v.reshape(num_video_pages * page_size, num_h_stored, src_v.shape[3])
+                kept = cache_layer.kept_head_indices.tolist()
+                for i, h in enumerate(kept):
+                    target_keys[:, :video_tokens_used, h:h+1, :].copy_(
+                        src_k_flat[:, i:i+1, :], non_blocking=True)
+                    target_values[:, :video_tokens_used, h:h+1, :].copy_(
+                        src_v_flat[:, i:i+1, :], non_blocking=True)
+            else:
+                num_h = src_k.shape[2]
+                src_k_2d = src_k.reshape(num_video_pages * page_size, num_h, src_k.shape[3])
+                src_v_2d = src_v.reshape(num_video_pages * page_size, num_h, src_v.shape[3])
+                target_keys[:, :video_tokens_used].copy_(src_k_2d, non_blocking=True)
+                target_values[:, :video_tokens_used].copy_(src_v_2d, non_blocking=True)
         else:
-            # src_k shape: [top_k, page_size, H, D] → reshape to [top_k*page_size, H, D]
-            num_h = src_k.shape[2]
-            src_k_2d = src_k.reshape(top_k * page_size, num_h, src_k.shape[3])
-            src_v_2d = src_v.reshape(top_k * page_size, num_h, src_v.shape[3])
-            self._gpu_keys[:, :video_tokens_used].copy_(src_k_2d, non_blocking=True)
-            self._gpu_values[:, :video_tokens_used].copy_(src_v_2d, non_blocking=True)
+            # Quest selected pages — DMA each page directly from pinned paged_kv
+            # to GPU buffer. Avoids staging buffer double-copy and temporary
+            # allocation. Each paged_kv[page_idx] is a view of the pinned tensor,
+            # so copy_() is truly async DMA.
+            sel_list = selected_pages.tolist()
+
+            if cache_layer.is_pruned:
+                target_keys[:, :video_tokens_used].fill_(PRUNED_HEAD_KEY_SENTINEL)
+                target_values[:, :video_tokens_used].fill_(0.0)
+                kept = cache_layer.kept_head_indices.tolist()
+                for i, page_idx in enumerate(sel_list):
+                    start = i * page_size
+                    end = start + page_size
+                    page_k = cache_layer.video_paged_keys[page_idx]  # [page_size, H_stored, D]
+                    page_v = cache_layer.video_paged_values[page_idx]
+                    for j, h in enumerate(kept):
+                        target_keys[:, start:end, h:h+1, :].copy_(
+                            page_k[:, j:j+1, :], non_blocking=True)
+                        target_values[:, start:end, h:h+1, :].copy_(
+                            page_v[:, j:j+1, :], non_blocking=True)
+            else:
+                for i, page_idx in enumerate(sel_list):
+                    start = i * page_size
+                    end = start + page_size
+                    target_keys[:, start:end].copy_(
+                        cache_layer.video_paged_keys[page_idx], non_blocking=True)
+                    target_values[:, start:end].copy_(
+                        cache_layer.video_paged_values[page_idx], non_blocking=True)
 
         # === Build contiguous text region ===
         if text_seq_len > 0:
-            self._gpu_keys[:, video_tokens_used:total_len].copy_(
+            target_keys[:, video_tokens_used:total_len].copy_(
                 cache_layer.text_keys[:, :text_seq_len], non_blocking=True)
-            self._gpu_values[:, video_tokens_used:total_len].copy_(
+            target_values[:, video_tokens_used:total_len].copy_(
                 cache_layer.text_values[:, :text_seq_len], non_blocking=True)
 
-        torch.cuda.current_stream().synchronize()
-        return self._gpu_keys, self._gpu_values, total_len
+        if sync:
+            torch.cuda.current_stream().synchronize()
+        return target_keys, target_values, total_len, video_tokens_used
 
     def offload_after_decode(self, layer_idx: int):
         cache_layer = self.layers[layer_idx]
@@ -955,6 +1051,148 @@ class SparseKVCacheManager(KVCacheManager):
             self._gpu_values[:, buf_pos:buf_pos + 1])
         cache_layer.text_seq_len += 1
 
+    # ----------------------------------------------------------------
+    # Pipeline methods: overlap attention computation with KV prefetch
+    # ----------------------------------------------------------------
+
+    def enable_pipeline(self):
+        """Enable pipeline mode. Must be called before prefill.
+
+        Allocates a dedicated CUDA stream for async DMA prefetch and
+        a CUDA event for Q-readiness signaling. Requires Quest mode
+        (paged=True), enforced by config validation.
+        """
+        assert self.paged, "Pipeline requires Quest mode (dynamic_sparse_threshold)"
+        self._pipeline = True
+        self._prefetch_stream = torch.cuda.Stream()
+        self._q_ready_event = torch.cuda.Event(enable_timing=False, blocking=False)
+
+    def _get_buffer_pair(self, slot: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (keys, values) GPU buffer for the given slot (0 or 1)."""
+        if slot == 0:
+            return self._gpu_keys, self._gpu_values
+        return self._gpu_keys_alt, self._gpu_values_alt
+
+    def load_layer_to_gpu_pipeline(
+        self, layer_idx: int, slot: int, q: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Load layer KV to a specific buffer slot (synchronous).
+
+        Used for layer 0 (no prior Q for prefetch) and as the internal
+        workhorse for both sync and async loads.
+
+        Args:
+            layer_idx: transformer layer index
+            slot:      buffer slot (0=primary, 1=alt)
+            q:         optional query tensor for Quest scoring. If None,
+                       uses self.current_query (backward-compatible).
+
+        Returns:
+            (keys, values, cache_seqlens) for the target buffer slot.
+        """
+        cache_layer = self.layers[layer_idx]
+        video_len = cache_layer.video_len
+        text_seq_len = cache_layer.text_seq_len
+        target_keys, target_values = self._get_buffer_pair(slot)
+
+        if q is not None:
+            self.set_current_query(q)
+
+        _, _, total_len, video_tokens_used = self._load_layer_quest(
+            cache_layer, video_len, text_seq_len,
+            target_keys=target_keys, target_values=target_values,
+            sync=True,
+        )
+
+        # Store slot metadata for offload_after_decode_pipeline
+        self._slot_info[slot] = {
+            "cache_seqlens": total_len,
+            "video_tokens_used": video_tokens_used,
+        }
+
+        return target_keys, target_values, total_len
+
+    def start_prefetch(self, next_layer_idx: int, q: torch.Tensor, slot: int):
+        """Start async prefetch of next layer's KV on the prefetch stream.
+
+        Records a CUDA event after Q computation on the default stream,
+        then submits Quest scoring + DMA copy to the prefetch stream.
+        Uses stream.wait_event() (GPU-side sync) so the prefetch stream
+        waits for Q without blocking the CPU. This allows the CPU to
+        immediately submit flash_attn to the default stream.
+
+        Args:
+            next_layer_idx: layer to prefetch
+            q:              current layer's post-RoPE query [1, 1, H_q, D]
+            slot:           target buffer slot for the prefetched data
+        """
+        # Signal that Q is ready on the default stream
+        self._q_ready_event.record(torch.cuda.current_stream())
+
+        # Set Q for Quest scoring (Python attribute, immediate)
+        self.set_current_query(q)
+
+        cache_layer = self.layers[next_layer_idx]
+        video_len = cache_layer.video_len
+        text_seq_len = cache_layer.text_seq_len
+        target_keys, target_values = self._get_buffer_pair(slot)
+
+        with torch.cuda.stream(self._prefetch_stream):
+            # GPU-side sync: prefetch stream waits for Q to be ready
+            # without blocking the CPU (unlike event.synchronize())
+            self._prefetch_stream.wait_event(self._q_ready_event)
+
+            _, _, total_len, video_tokens_used = self._load_layer_quest(
+                cache_layer, video_len, text_seq_len,
+                target_keys=target_keys, target_values=target_values,
+                sync=False,  # no sync — caller does wait_prefetch()
+            )
+
+            # Store slot metadata for offload_after_decode_pipeline
+            self._slot_info[slot] = {
+                "cache_seqlens": total_len,
+                "video_tokens_used": video_tokens_used,
+            }
+
+    def wait_prefetch(self):
+        """Block the default stream until the prefetch stream finishes."""
+        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+
+    def offload_after_decode_pipeline(self, layer_idx: int, slot: int):
+        """Offload new token's KV from a specific buffer slot back to CacheLayer.
+
+        Reads the buffer layout (video_tokens_used, cache_seqlens) from
+        _slot_info[slot] to locate the new token's position in the buffer.
+
+        Args:
+            layer_idx: transformer layer index
+            slot:      buffer slot that holds this layer's KV
+        """
+        cache_layer = self.layers[layer_idx]
+        target_keys, target_values = self._get_buffer_pair(slot)
+        info = self._slot_info[slot]
+        video_tokens_used = info["video_tokens_used"]
+
+        # New token is at position video_tokens_used + text_seq_len (before increment)
+        text_seq_len_before_inc = cache_layer.text_seq_len
+        buf_pos = video_tokens_used + text_seq_len_before_inc
+
+        cache_layer.text_keys[:, text_seq_len_before_inc:text_seq_len_before_inc + 1].copy_(
+            target_keys[:, buf_pos:buf_pos + 1])
+        cache_layer.text_values[:, text_seq_len_before_inc:text_seq_len_before_inc + 1].copy_(
+            target_values[:, buf_pos:buf_pos + 1])
+        cache_layer.text_seq_len += 1
+
+    def get_buffer(self, slot: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Return (keys, values, cache_seqlens) for a buffer slot.
+
+        Used by the pipeline decode loop to pass the correct buffer
+        to flash_attn_with_kvcache.
+        """
+        keys, values = self._get_buffer_pair(slot)
+        cache_seqlens = self._slot_info[slot]["cache_seqlens"]
+        return keys, values, cache_seqlens
+
     def clear(self):
         self.layers = [
             SparseCacheLayer(self.config.max_new_tokens, paged=self.paged, page_size=self.page_size)
@@ -964,10 +1202,16 @@ class SparseKVCacheManager(KVCacheManager):
         self._apply_pruning_info()
         self._gpu_keys = None
         self._gpu_values = None
+        self._gpu_keys_alt = None
+        self._gpu_values_alt = None
         self.video_info = None
         self.video_indices = None
         self.text_indices = None
         self.current_query = None
+        self._slot_info = [
+            {"cache_seqlens": 0, "video_tokens_used": 0},
+            {"cache_seqlens": 0, "video_tokens_used": 0},
+        ]
         torch.cuda.empty_cache()
 
     def get_memory_stats(self) -> dict[str, int]:
@@ -999,6 +1243,8 @@ class SparseKVCacheManager(KVCacheManager):
         gpu_buffer = 0
         if self._gpu_keys is not None:
             gpu_buffer = self._gpu_keys.nbytes + self._gpu_values.nbytes
+        if self._gpu_keys_alt is not None:
+            gpu_buffer += self._gpu_keys_alt.nbytes + self._gpu_values_alt.nbytes
 
         return {
             "kv_cache_gpu_bytes": kv_gpu,
