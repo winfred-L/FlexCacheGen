@@ -12,7 +12,7 @@ dependencies = [
     "torch>=2.9",
     "torchvision",
     "flash-attn>=2.8.3",
-    "transformers>=4.57.3",
+    "transformers>=5.5.0",
     "qwen_vl_utils",
     #"triton",
     #"xxhash",

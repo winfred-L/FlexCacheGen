@@ -12,7 +12,9 @@ def get_video_features(
     video_grid_thw: Optional[torch.LongTensor] = None
 ):
     pixel_values_videos = pixel_values_videos.to(visual_encoder.dtype)
-    video_embeds, deepstack_video_embeds = visual_encoder(pixel_values_videos, grid_thw=video_grid_thw)
+    output = visual_encoder(pixel_values_videos, grid_thw=video_grid_thw)
+    video_embeds = output.pooler_output
+    deepstack_video_embeds = output.deepstack_features
     split_sizes = (video_grid_thw.prod(-1) // visual_encoder.spatial_merge_size**2).tolist()
     image_embeds = torch.split(video_embeds, split_sizes)
     return image_embeds, deepstack_video_embeds
