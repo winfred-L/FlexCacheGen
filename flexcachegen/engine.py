@@ -145,16 +145,14 @@ class VLMEngine:
         dedicated CUDA stream, layer L's flash_attn + MLP runs on the default
         stream. Uses ping-pong dual GPU buffers (slot 0 and slot 1).
 
-        Layer 0 has no prior Q, so its KV is loaded synchronously before
-        the loop begins.
+        Layer 0 has no prior Q, so its KV is loaded synchronously — but after
+        Q is computed so that the pruning sentinel (when active) uses the
+        correct Q rather than a stale or None value.
         """
         hidden_states = self.model.text_embed(token_id)
         self.model.set_rotary_pos_emb(hidden_states, cur_pos_idx)
         mgr = self.kv_cache_manager
         current_slot = 0
-
-        # Layer 0: sync load (no prior Q for prefetch)
-        mgr.load_layer_to_gpu_pipeline(0, slot=0)
 
         for layer_idx in range(self.num_hidden_layers):
             attn = self.model.language_model.layers[layer_idx].self_attn
@@ -164,12 +162,19 @@ class VLMEngine:
                 hidden_states, self.model.position_embeddings
             )
 
-            # Step 2: Start async prefetch for next layer using current Q
+            # Step 2: For layer 0, sync-load the buffer NOW (after Q is
+            # available), so that the pruning sentinel in _fill_pruned_sentinel
+            # uses the correct Q. For layers > 0, the buffer was already
+            # prefetched by the previous iteration's start_prefetch().
+            if layer_idx == 0:
+                mgr.load_layer_to_gpu_pipeline(0, slot=0, q=q)
+
+            # Step 3: Start async prefetch for next layer using current Q
             if layer_idx < self.num_hidden_layers - 1:
                 next_slot = 1 - current_slot
                 mgr.start_prefetch(layer_idx + 1, q, slot=next_slot)
 
-            # Step 3: Run attention on current buffer
+            # Step 4: Run attention on current buffer
             k_cache, v_cache, cache_seqlens = mgr.get_buffer(current_slot)
             # Expose current slot to attention so offload can find the right buffer
             mgr._current_pipeline_slot = current_slot
@@ -177,11 +182,11 @@ class VLMEngine:
                 q, k, v, residual, k_cache, v_cache, cache_seqlens, mgr
             )
 
-            # Step 4: MLP (runs on default stream, overlaps with prefetch on
+            # Step 5: MLP (runs on default stream, overlaps with prefetch on
             # the prefetch stream)
             hidden_states = self.model.mlp(hidden_states, layer_idx)
 
-            # Step 5: Wait for prefetch to complete before next iteration
+            # Step 6: Wait for prefetch to complete before next iteration
             # (after MLP so MLP overlaps with the tail of the prefetch)
             if layer_idx < self.num_hidden_layers - 1:
                 mgr.wait_prefetch()

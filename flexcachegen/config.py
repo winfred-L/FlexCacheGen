@@ -70,13 +70,17 @@ class Config:
     sparse_kv: bool = True
         # True: split video/text KV cache storage, use `SparseKVCacheManager`
         # False: use `KVCacheManager`
-    static_sparse_threshold: str | None = None#'0.1'
+    static_sparse_threshold: str | None = None
         # if not None, apply static sparsity with the given threshold
         # (e.g., '0.2' means pruning heads with visual score less than 0.2)
     static_sparse_prune_heads: dict[int, list[int]] | None = None  # {layer_idx: [head_indices]}
         # inferred from `static_sparse_threshold` when initialized
-    
-    dynamic_sparse_threshold: float | None = 0.1  # TODO
+    pruning_k_type: str = "negative"
+        # "zero": fill pruned head K vectors with zeros (legacy behavior, NOT SUGGESTED)
+        # "negative": fill pruned head K vectors with -M * sign(Q), so that
+        #             Q·K is a large negative value → softmax ≈ 0 (true pruning)
+
+    dynamic_sparse_threshold: float | None = None
     page_size: int = 256  # FA2 paged attention block size (must be multiple of 256)
 
     # Pipeline: overlap attention computation with KV prefetch (decode only)
@@ -99,6 +103,8 @@ class Config:
             self.static_sparse_threshold = kwargs.pop('static_sparse_threshold')
         if 'dynamic_sparse_threshold' in kwargs:
             self.dynamic_sparse_threshold = kwargs.pop('dynamic_sparse_threshold')
+        if 'pruning_k_type' in kwargs:
+            self.pruning_k_type = kwargs.pop('pruning_k_type')
         if 'pipeline' in kwargs:
             self.pipeline = kwargs.pop('pipeline')
 
@@ -127,6 +133,7 @@ class Config:
             total_pruned = sum(len(v) for v in self.static_sparse_prune_heads.values())
             total_heads = self.hf_config.text_config.num_key_value_heads * self.hf_config.text_config.num_hidden_layers
             print(f"    Pruning {total_pruned}/{total_heads} heads ({total_pruned/total_heads:.1%} sparsity)")
+            print(f"    Pruning K type: {self.pruning_k_type}")
         if self.dynamic_sparse_threshold is not None:
             print(f"  Dynamic sparse threshold: {self.dynamic_sparse_threshold}")
         print(f"Pipeline:           ", self.pipeline)

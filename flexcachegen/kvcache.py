@@ -2,10 +2,11 @@ import torch
 from flexcachegen.config import Config
 from flexcachegen.utils import VideoInfo
 
-# Sentinel value for pruned video KV head keys. A large finite negative so that
-# QK^T produces very negative scores and softmax maps them to ~0.
-# We avoid -inf because 0 * -inf = NaN in IEEE 754.
-PRUNED_HEAD_KEY_SENTINEL = 0.0 #-1e4
+# Legacy sentinel constant for pruned video KV head keys.
+# Superseded by config.pruning_k_type which controls sentinel behavior:
+#   "zero":     K filled with 0.0 (legacy, softmax ≈ 1/N, not true pruning)
+#   "negative": K filled with -M*sign(Q), giving Q·K ≪ 0 → softmax ≈ 0
+PRUNED_HEAD_KEY_SENTINEL = 0.0
 
 
 class CacheLayer:
@@ -640,6 +641,7 @@ class SparseKVCacheManager(KVCacheManager):
         # If config provides a prune-heads map ({layer_idx: [head_indices]}), apply
         # it to each SparseCacheLayer so that video KV storage is compressed.
         self.prune_heads_map: dict[int, list[int]] | None = config.static_sparse_prune_heads
+        self.pruning_k_type: str = getattr(config, 'pruning_k_type', 'zero')
         self._apply_pruning_info()
 
         # --- Quest (dynamic seq-dimension sparsity) ---
@@ -709,6 +711,61 @@ class SparseKVCacheManager(KVCacheManager):
         # Non-divisible ratio fallback: broadcast global Q mean to each KV head.
         q_mean = q.mean(dim=2)  # [1, 1, head_dim]
         return q_mean.expand(1, 1, self.num_kv_heads, head_dim).reshape(self.num_kv_heads, head_dim)
+
+    def _get_pruned_key_sentinel(self) -> torch.Tensor | float:
+        """
+        Compute the K sentinel value for pruned attention heads.
+
+        The sentinel is derived from self.current_query, which is set by the
+        attention layer via set_current_query(). In sequential decode this is
+        always the current layer's own Q. In pipeline mode, layers > 0 use the
+        PREVIOUS layer's Q (the next layer's Q is not available yet), which is
+        a minor approximation — see _fill_pruned_sentinel() for details.
+
+        Returns:
+            If pruning_k_type == "zero" or current_query is None: 0.0 (float).
+            If pruning_k_type == "negative": [num_kv_heads, head_dim] tensor where
+                each element is -M * sign(Q[head, dim]), so that Q·K is a large
+                negative value → softmax ≈ 0, truly eliminating the pruned head.
+        """
+        if self.pruning_k_type == "zero" or self.current_query is None:
+            return 0.0
+        # "negative" mode: per-element sentinel driven by query sign
+        q_kv = self._map_q_to_kv_heads(self.current_query)  # [num_kv_heads, head_dim]
+        return -1e4 * torch.sign(q_kv)  # [num_kv_heads, head_dim]
+
+    def _fill_pruned_sentinel(
+        self,
+        target_keys: torch.Tensor,
+        target_values: torch.Tensor,
+        num_tokens: int,
+    ):
+        """
+        Fill the video region of the GPU buffer with pruning sentinel values.
+
+        For pruning_k_type="zero": keys are filled with 0.0, values with 0.0.
+        For pruning_k_type="negative": keys are filled with -M*sign(Q) per
+        element so that Q·K is a large negative → softmax ≈ 0.
+
+        In pipeline mode, the Q used for the sentinel is the PREVIOUS layer's Q
+        (because the next layer's Q is not yet computed when its KV is prefetched).
+        Adjacent transformer layers have highly correlated Q sign patterns (>90%),
+        so the effective negativity remains ≈ -1e4 * head_dim * 0.8+, which is
+        still deep in the softmax saturation region. The known exception is layer 0,
+        which now receives its own Q via load_layer_to_gpu_pipeline(q=q0).
+
+        Args:
+            target_keys:   GPU key buffer [1, max_seq_len, num_kv_heads, head_dim]
+            target_values: GPU value buffer, same shape
+            num_tokens:    number of video tokens to fill (video_len or video_tokens_used)
+        """
+        sentinel = self._get_pruned_key_sentinel()
+        if isinstance(sentinel, float):
+            target_keys[:, :num_tokens].fill_(sentinel)
+        else:
+            # sentinel is [num_kv_heads, head_dim]; broadcast to buffer shape
+            target_keys[:, :num_tokens] = sentinel[None, None, :, :]
+        target_values[:, :num_tokens].fill_(0.0)
 
     def _apply_pruning_info(self):
         """
@@ -836,8 +893,7 @@ class SparseKVCacheManager(KVCacheManager):
 
         # --- Video KV region [0:video_len] ---
         if cache_layer.is_pruned:
-            self._gpu_keys[:, :video_len].fill_(PRUNED_HEAD_KEY_SENTINEL)
-            self._gpu_values[:, :video_len].fill_(0.0)
+            self._fill_pruned_sentinel(self._gpu_keys, self._gpu_values, video_len)
 
             kept = cache_layer.kept_head_indices.tolist()
             for i, h in enumerate(kept):
@@ -958,8 +1014,7 @@ class SparseKVCacheManager(KVCacheManager):
             src_v = cache_layer.video_paged_values
 
             if cache_layer.is_pruned:
-                target_keys[:, :video_tokens_used].fill_(PRUNED_HEAD_KEY_SENTINEL)
-                target_values[:, :video_tokens_used].fill_(0.0)
+                self._fill_pruned_sentinel(target_keys, target_values, video_tokens_used)
                 num_h_stored = src_k.shape[2]
                 src_k_flat = src_k.reshape(num_video_pages * page_size, num_h_stored, src_k.shape[3])
                 src_v_flat = src_v.reshape(num_video_pages * page_size, num_h_stored, src_v.shape[3])
@@ -983,8 +1038,7 @@ class SparseKVCacheManager(KVCacheManager):
             sel_list = selected_pages.tolist()
 
             if cache_layer.is_pruned:
-                target_keys[:, :video_tokens_used].fill_(PRUNED_HEAD_KEY_SENTINEL)
-                target_values[:, :video_tokens_used].fill_(0.0)
+                self._fill_pruned_sentinel(target_keys, target_values, video_tokens_used)
                 kept = cache_layer.kept_head_indices.tolist()
                 for i, page_idx in enumerate(sel_list):
                     start = i * page_size
@@ -1081,11 +1135,18 @@ class SparseKVCacheManager(KVCacheManager):
         Used for layer 0 (no prior Q for prefetch) and as the internal
         workhorse for both sync and async loads.
 
+        When q is provided (layer 0 case), it is set as self.current_query
+        before loading, so the pruning sentinel uses the correct Q rather
+        than a stale or None value. For layers > 0, the buffer is loaded
+        by start_prefetch() which sets current_query from the previous
+        layer's Q before entering the prefetch stream.
+
         Args:
             layer_idx: transformer layer index
             slot:      buffer slot (0=primary, 1=alt)
-            q:         optional query tensor for Quest scoring. If None,
-                       uses self.current_query (backward-compatible).
+            q:         optional query tensor for Quest scoring and pruning
+                       sentinel. If None, uses self.current_query
+                       (backward-compatible, but may be stale).
 
         Returns:
             (keys, values, cache_seqlens) for the target buffer slot.
@@ -1120,6 +1181,11 @@ class SparseKVCacheManager(KVCacheManager):
         Uses stream.wait_event() (GPU-side sync) so the prefetch stream
         waits for Q without blocking the CPU. This allows the CPU to
         immediately submit flash_attn to the default stream.
+
+        The passed Q is the CURRENT layer's Q, which is used for both Quest
+        page selection and pruning sentinel computation on the NEXT layer.
+        This is a minor approximation: adjacent layers have highly correlated
+        Q sign patterns, so the sentinel remains effective.
 
         Args:
             next_layer_idx: layer to prefetch
