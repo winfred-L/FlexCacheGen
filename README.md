@@ -23,7 +23,6 @@ FlexCacheGen combines Offloading([FlexGen](https://github.com/FMInference/FlexLL
 - Dynamic KV Selection without permanent eviction, better accuracy kept. (supported by multi-tier storage)
 - Paged KV cache management, less wasted memory.
 - Overlapping attention computation with KV cache IO, faster inference speed.
-- Reordering video KV based on spatial structural information, improved data locality. 
 
 
 ### Supported Models
@@ -62,13 +61,6 @@ pip install torchcodec --index-url https://download.pytorch.org/whl/cu130
 pip install -e . # -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-### Run Example
-
-```bash
-python ./scripts/example.sh
-```
-
-
 ### Model and Dataset Download
 
 ```bash
@@ -85,4 +77,13 @@ modelscope download --dataset AI-ModelScope/MLVU --local_dir /path/to/datasets/M
 modelscope download --dataset AI-ModelScope/MLVU --local_dir /path/to/datasets/MLVU --include 'MLVU/video/9_summary/*'
 ```
 
+### Setup env
+
+create `.env` from `.env.example` and setup model/dataset path.
+
+### Run Example
+
+```bash
+python ./scripts/example.sh
+```
 
