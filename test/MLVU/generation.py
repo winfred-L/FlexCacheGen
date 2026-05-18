@@ -2,9 +2,33 @@ import argparse
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 from tqdm import tqdm
 
 from flexcachegen.engine import VLMEngine
+
+
+def _load_dotenv():
+    """Load .env from project root (nearest parent directory containing .env)."""
+    current = Path(__file__).resolve().parent
+    for parent in [current] + list(current.parents):
+        env_file = parent / '.env'
+        if env_file.exists():
+            with open(env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, _, value = line.partition('=')
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key not in os.environ:
+                        os.environ[key] = value
+            return
+
+_load_dotenv()
+
+DATASET_ROOT = os.environ.get('DATASET_ROOT', '/data/lyc/datasets')
 
 
 def parse_args() -> argparse.Namespace:
@@ -14,7 +38,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--model-type", default="qwen3vl-8b")
-    parser.add_argument("--dataset-dir", default="/data1/lyc/datasets/MLVU/MLVU")
+    parser.add_argument("--dataset-dir", default=os.path.join(DATASET_ROOT, 'MLVU', 'MLVU'))
     parser.add_argument("--static-sparse-threshold", type=str, default=None,
                         help="Static sparsity threshold, e.g. '0.1', '0.3'")
     parser.add_argument("--dynamic-sparse-threshold", type=float, default=None,

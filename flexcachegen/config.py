@@ -1,10 +1,34 @@
 import os
+from pathlib import Path
 import torch
 from transformers import AutoConfig
 
+
+def _load_dotenv():
+    """Load .env from project root (nearest parent directory containing .env)."""
+    current = Path(__file__).resolve().parent
+    for parent in [current] + list(current.parents):
+        env_file = parent / '.env'
+        if env_file.exists():
+            with open(env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, _, value = line.partition('=')
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key not in os.environ:
+                        os.environ[key] = value
+            return
+
+_load_dotenv()
+
+MODEL_ROOT = os.environ.get('MODEL_ROOT', '/data/lyc/models')
+
 # TODO: currently only support for qwen3vl-8b
 MODEL_REGISTRY: dict[str, str] = {
-    'qwen3vl-8b': '/data/lyc/models/Qwen3-VL-8B-Instruct',
+    'qwen3vl-8b': os.path.join(MODEL_ROOT, 'Qwen3-VL-8B-Instruct'),
 }
 
 # TODO: currently only support for qwen3vl-8b

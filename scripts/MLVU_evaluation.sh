@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 set -e
 
-export API_KEY="sk-JZTZcaSrvIvSQUpdnVCUyVTOzCLBSSVyxF0wbkUfDzFaKVTz"
+# load .env from project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+set -a
+source "${SCRIPT_DIR}/../.env"
+set +a
 
 # ========== config ==========
 
 TASK="8_sub_scene"    # 8_sub_scene / 9_summary
 METRICS="all"     # gpt / bert / rouge / all / "bert rouge"
 
-PRED_DIR="/data1/lyc/flexcachegen_outputs/pred"
+PRED_DIR="${OUTPUT_ROOT}/pred"
 PRED_FILE_NAMES=(
   "qwen3vl-8b--MLVU_8_sub_scene--2026-05-05_14-22-58"
 )
-OUTPUT_DIR="/data1/lyc/flexcachegen_outputs/acc"
+OUTPUT_DIR="${OUTPUT_ROOT}/acc"
 
 # ========== run ==========
 

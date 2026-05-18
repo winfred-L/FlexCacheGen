@@ -1,11 +1,14 @@
 from flexcachegen.engine import VLMEngine
+import os
+
+DATASET_ROOT = os.environ.get('DATASET_ROOT', '/data/lyc/datasets')
 
 def main():
     vlm = VLMEngine(model_type='qwen3vl-8b')
     
     samples = [
         ("./test/video/28s.mp4", 'Please describe this video in detail.'),
-        # ("/data1/lyc/datasets/MLVU/MLVU/video/9_summary/217.mp4", 'Please describe this video in detail.'),
+        # (f"{DATASET_ROOT}/MLVU/MLVU/video/9_summary/217.mp4", 'Please describe this video in detail.'),
     ]
     outputs = []
 

@@ -6,7 +6,7 @@ Features:
 - Select metrics: gpt / bert / rouge / all
 - GPT scoring with OpenAI-compatible API
 - BERTScore with local roberta-large model
-  - If /data1/lyc/models/roberta-large is missing or incomplete, download it from ModelScope automatically
+  - If the local roberta-large model is missing or incomplete, download it from ModelScope automatically
 - ROUGE scoring
 '''
 
@@ -21,6 +21,29 @@ from tqdm import tqdm
 import logging
 import warnings
 
+
+def _load_dotenv():
+    """Load .env from project root (nearest parent directory containing .env)."""
+    current = Path(__file__).resolve().parent
+    for parent in [current] + list(current.parents):
+        env_file = parent / '.env'
+        if env_file.exists():
+            with open(env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, _, value = line.partition('=')
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key not in os.environ:
+                        os.environ[key] = value
+            return
+
+_load_dotenv()
+
+MODEL_ROOT = os.environ.get('MODEL_ROOT', '/data/lyc/models')
+
 # Suppress BERT HuggingFace Transformers warnings
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -34,7 +57,7 @@ eval_model_type = None
 
 
 DEFAULT_BERT_MODEL_ID = "AI-ModelScope/roberta-large"
-DEFAULT_BERT_LOCAL_MODEL_PATH = "/data1/lyc/models/roberta-large"
+DEFAULT_BERT_LOCAL_MODEL_PATH = os.path.join(MODEL_ROOT, 'roberta-large')
 
 
 # -----------------------------
