@@ -145,9 +145,10 @@ class VLMEngine:
         dedicated CUDA stream, layer L's flash_attn + MLP runs on the default
         stream. Uses ping-pong dual GPU buffers (slot 0 and slot 1).
 
-        Layer 0 has no prior Q, so its KV is loaded synchronously — but after
-        Q is computed so that the pruning sentinel (when active) uses the
-        correct Q rather than a stale or None value.
+        Layer 0 has no prior Q, so its KV is loaded synchronously with its
+        own Q (correct pruning sentinel). For layers > 0, the buffer was
+        prefetched with the previous layer's Q; _refill_pruned_sentinel()
+        corrects the sentinel once the current layer's Q is available.
         """
         hidden_states = self.model.text_embed(token_id)
         self.model.set_rotary_pos_emb(hidden_states, cur_pos_idx)
@@ -162,12 +163,14 @@ class VLMEngine:
                 hidden_states, self.model.position_embeddings
             )
 
-            # Step 2: For layer 0, sync-load the buffer NOW (after Q is
-            # available), so that the pruning sentinel in _fill_pruned_sentinel
-            # uses the correct Q. For layers > 0, the buffer was already
-            # prefetched by the previous iteration's start_prefetch().
+            # Step 2: For layer 0, sync-load the buffer with the correct Q.
+            # For layers > 0, the buffer was prefetched by the previous
+            # iteration's start_prefetch() using Q_{L-1}. The pruning sentinel
+            # in the buffer is based on Q_{L-1} — correct it now with Q_L.
             if layer_idx == 0:
                 mgr.load_layer_to_gpu_pipeline(0, slot=0, q=q)
+            else:
+                mgr._refill_pruned_sentinel(layer_idx, current_slot, q)
 
             # Step 3: Start async prefetch for next layer using current Q
             if layer_idx < self.num_hidden_layers - 1:
