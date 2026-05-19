@@ -455,21 +455,21 @@ def annotate_bert(
         enc = tokenizer(text, return_tensors='pt', truncation=True, max_length=max_tokens)
         return tokenizer.decode(enc['input_ids'][0], skip_special_tokens=True)
 
-    # Process one at a time to avoid sequence length mismatches
-    f1_list = []
-    for ref, pred in tqdm(zip(refs, preds), desc="bert", total=len(refs)):
-        ref_trunc = truncate(ref, max_tokens=max_tokens)
-        pred_trunc = truncate(pred, max_tokens=max_tokens)
-        _, _, F1 = score(
-            [pred_trunc],
-            [ref_trunc],
-            model_type=model_path,
-            num_layers=num_layers,
-            verbose=False,
-            rescale_with_baseline=False,
-            batch_size=1,
-        )
-        f1_list.append(F1.item())
+    # Truncate all texts first
+    truncated_refs = [truncate(r, max_tokens=max_tokens) for r in refs]
+    truncated_preds = [truncate(p, max_tokens=max_tokens) for p in preds]
+
+    # Single score() call to avoid reloading the model for every sample
+    _, _, F1 = score(
+        truncated_preds,
+        truncated_refs,
+        model_type=model_path,
+        num_layers=num_layers,
+        verbose=False,
+        rescale_with_baseline=False,
+        batch_size=8,
+    )
+    f1_list = F1.tolist()
 
     return f1_list, sum(f1_list) / len(f1_list)
 
