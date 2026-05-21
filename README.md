@@ -84,6 +84,6 @@ create `.env` from `.env.example` and setup model/dataset path.
 ### Run Example
 
 ```bash
-python ./scripts/example.sh
+CUDA_VISIBLE_DEVICES=0 python main.py
 ```
 
