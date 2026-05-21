@@ -672,6 +672,12 @@ class SparseKVCacheManager(KVCacheManager):
             {"cache_seqlens": 0, "video_tokens_used": 0},
         ]
 
+        # CPU staging buffer for bulk DMA: selected pages are gathered into a
+        # contiguous pinned buffer before a single DMA transfer, replacing the
+        # per-page per-head copy loop.
+        self._cpu_staging_keys: torch.Tensor | None = None
+        self._cpu_staging_values: torch.Tensor | None = None
+
     def set_current_query(self, q: torch.Tensor):
         """
         Register the current decode-step query so the next load_layer_to_gpu()
@@ -917,6 +923,24 @@ class SparseKVCacheManager(KVCacheManager):
         torch.cuda.current_stream().synchronize()
         return self._gpu_keys, self._gpu_values, total_len
 
+    def _ensure_cpu_staging(
+        self, num_tokens: int, num_heads: int, head_dim: int, dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Lazy-allocate or reuse CPU pinned staging buffer for bulk DMA.
+
+        Returns a contiguous pinned-memory buffer pair (keys, values) of shape
+        [num_tokens, num_heads, head_dim]. Reuses the previous allocation when
+        the shape matches; reallocates only when a larger buffer is needed
+        (e.g. different video length or pruning ratio across layers).
+        """
+        shape = (num_tokens, num_heads, head_dim)
+        if self._cpu_staging_keys is None or self._cpu_staging_keys.shape != shape:
+            self._cpu_staging_keys = torch.empty(
+                shape, dtype=dtype, device='cpu', pin_memory=True)
+            self._cpu_staging_values = torch.empty(
+                shape, dtype=dtype, device='cpu', pin_memory=True)
+        return self._cpu_staging_keys, self._cpu_staging_values
+
     def _load_layer_quest(
         self,
         cache_layer: SparseCacheLayer,
@@ -1034,33 +1058,51 @@ class SparseKVCacheManager(KVCacheManager):
                 target_keys[:, :video_tokens_used].copy_(src_k_2d, non_blocking=True)
                 target_values[:, :video_tokens_used].copy_(src_v_2d, non_blocking=True)
         else:
-            # Quest selected pages — DMA each page directly from pinned paged_kv
-            # to GPU buffer. Avoids staging buffer double-copy and temporary
-            # allocation. Each paged_kv[page_idx] is a view of the pinned tensor,
-            # so copy_() is truly async DMA.
+            # Quest selected pages — gather into contiguous CPU pinned buffer,
+            # then issue a small number of bulk DMA transfers. The old per-page
+            # approach created top_k * H_stored * 2 copy_() calls (e.g. 896 for
+            # pruned), each transferring only 64 KB with strided 2D memcpy. The
+            # bulk approach does a CPU gather (fast memcpy within pinned memory)
+            # then H_stored*2 (pruned) or 2 (non-pruned) large contiguous DMAs.
             sel_list = selected_pages.tolist()
+            head_dim = target_keys.shape[-1]
 
             if cache_layer.is_pruned:
+                # Step 1: fill sentinel on GPU for all heads (fast GPU kernel)
                 self._fill_pruned_sentinel(target_keys, target_values, video_tokens_used)
+
+                # Step 2: CPU gather — copy selected pages into contiguous buffer
                 kept = cache_layer.kept_head_indices.tolist()
+                stag_k, stag_v = self._ensure_cpu_staging(
+                    video_tokens_used, len(kept), head_dim, target_keys.dtype)
                 for i, page_idx in enumerate(sel_list):
                     start = i * page_size
                     end = start + page_size
-                    page_k = cache_layer.video_paged_keys[page_idx]  # [page_size, H_stored, D]
-                    page_v = cache_layer.video_paged_values[page_idx]
-                    for j, h in enumerate(kept):
-                        target_keys[:, start:end, h:h+1, :].copy_(
-                            page_k[:, j:j+1, :], non_blocking=True)
-                        target_values[:, start:end, h:h+1, :].copy_(
-                            page_v[:, j:j+1, :], non_blocking=True)
+                    stag_k[start:end].copy_(cache_layer.video_paged_keys[page_idx])
+                    stag_v[start:end].copy_(cache_layer.video_paged_values[page_idx])
+
+                # Step 3: one contiguous DMA per kept head (H_stored * 2 calls)
+                for j, h in enumerate(kept):
+                    target_keys[:, :video_tokens_used, h:h+1, :].copy_(
+                        stag_k[:, j:j+1, :].unsqueeze(0), non_blocking=True)
+                    target_values[:, :video_tokens_used, h:h+1, :].copy_(
+                        stag_v[:, j:j+1, :].unsqueeze(0), non_blocking=True)
             else:
+                # Step 2: CPU gather all heads
+                num_h = target_keys.shape[2]
+                stag_k, stag_v = self._ensure_cpu_staging(
+                    video_tokens_used, num_h, head_dim, target_keys.dtype)
                 for i, page_idx in enumerate(sel_list):
                     start = i * page_size
                     end = start + page_size
-                    target_keys[:, start:end].copy_(
-                        cache_layer.video_paged_keys[page_idx], non_blocking=True)
-                    target_values[:, start:end].copy_(
-                        cache_layer.video_paged_values[page_idx], non_blocking=True)
+                    stag_k[start:end].copy_(cache_layer.video_paged_keys[page_idx])
+                    stag_v[start:end].copy_(cache_layer.video_paged_values[page_idx])
+
+                # Step 3: single DMA per KV
+                target_keys[:, :video_tokens_used].copy_(
+                    stag_k.unsqueeze(0), non_blocking=True)
+                target_values[:, :video_tokens_used].copy_(
+                    stag_v.unsqueeze(0), non_blocking=True)
 
         # === Build contiguous text region ===
         if text_seq_len > 0:
@@ -1324,6 +1366,8 @@ class SparseKVCacheManager(KVCacheManager):
             {"cache_seqlens": 0, "video_tokens_used": 0},
             {"cache_seqlens": 0, "video_tokens_used": 0},
         ]
+        self._cpu_staging_keys = None
+        self._cpu_staging_values = None
         torch.cuda.empty_cache()
 
     def get_memory_stats(self) -> dict[str, int]:
@@ -1358,10 +1402,15 @@ class SparseKVCacheManager(KVCacheManager):
         if self._gpu_keys_alt is not None:
             gpu_buffer += self._gpu_keys_alt.nbytes + self._gpu_values_alt.nbytes
 
+        cpu_staging = 0
+        if self._cpu_staging_keys is not None:
+            cpu_staging = self._cpu_staging_keys.nbytes + self._cpu_staging_values.nbytes
+
         return {
             "kv_cache_gpu_bytes": kv_gpu,
             "kv_cache_cpu_bytes": kv_cpu,
             "gpu_buffer_bytes": gpu_buffer,
+            "cpu_staging_buffer_bytes": cpu_staging,
             "video_kv_bytes": video_bytes,
             "text_kv_bytes": text_bytes,
         }

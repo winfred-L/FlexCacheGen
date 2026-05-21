@@ -375,6 +375,8 @@ class VLMEngine:
             print(f"   Video KV:          {format_bytes(kv_stats['video_kv_bytes'])}")
             print(f"   Text KV:           {format_bytes(kv_stats['text_kv_bytes'])}")
         print(f" GPU KV buffer:       {format_bytes(kv_stats['gpu_buffer_bytes'])}")
+        if kv_stats.get('cpu_staging_buffer_bytes', 0) > 0:
+            print(f" CPU staging buffer:  {format_bytes(kv_stats['cpu_staging_buffer_bytes'])}")
         print(f" Peak activation:")
         print(f"   Encoding:          {format_bytes(peak_encoding)}")
         print(f"   Prefill:           {format_bytes(peak_prefill)}")
