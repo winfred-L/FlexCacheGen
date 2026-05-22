@@ -25,6 +25,7 @@ def _load_dotenv():
 _load_dotenv()
 
 MODEL_ROOT = os.environ.get('MODEL_ROOT', '/data/lyc/models')
+OUTPUT_ROOT = os.environ.get('OUTPUT_ROOT', '/nvme1n1p1/lyc/flexcachegen_outputs')
 
 # TODO: currently only support for qwen3vl-8b
 MODEL_REGISTRY: dict[str, str] = {
@@ -89,6 +90,10 @@ class Config:
         #        requires dynamic_sparse_threshold (Quest) for page prediction
         # False: sequential decode (default)
 
+    save_attention_weights: bool = False
+        # True:  save softmax(QK^T) attention weights for every decode step,
+        #        layer, and head to OUTPUT_ROOT for visualization/analysis
+
     def __init__(self, model_type: str = 'qwen3vl-8b', **kwargs):
         if model_type not in MODEL_REGISTRY:
             raise ValueError(f"Unknown model_type '{model_type}'. Available: {list(MODEL_REGISTRY.keys())}")
@@ -107,6 +112,8 @@ class Config:
             self.pruning_k_type = kwargs.pop('pruning_k_type')
         if 'pipeline' in kwargs:
             self.pipeline = kwargs.pop('pipeline')
+        if 'save_attention_weights' in kwargs:
+            self.save_attention_weights = kwargs.pop('save_attention_weights')
 
         if self.pipeline and self.dynamic_sparse_threshold is None:
             raise ValueError('Dynamic sparse threshold is required for pipeline')
@@ -137,4 +144,5 @@ class Config:
         if self.dynamic_sparse_threshold is not None:
             print(f"  Dynamic sparse threshold: {self.dynamic_sparse_threshold}")
         print(f"Pipeline:           ", self.pipeline)
+        print("Save attn weights:  ", self.save_attention_weights)
         print("="*50)

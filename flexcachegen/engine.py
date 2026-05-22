@@ -1,10 +1,14 @@
-import torch
+import datetime
+import os
+from pathlib import Path
 from time import perf_counter
 
+import torch
 from transformers import AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-from flexcachegen.config import Config
+from flexcachegen.attention_weights import AttentionWeightCollector
+from flexcachegen.config import OUTPUT_ROOT, Config
 from flexcachegen.kvcache import KVCacheManager, SparseKVCacheManager
 from flexcachegen.models.qwen3vl import Qwen3VLModel
 from flexcachegen.utils import format_bytes
@@ -117,7 +121,30 @@ class VLMEngine:
     
     def is_finished(self, output_ids: list[int]) -> bool:
         return output_ids[-1] in self.config.eos_token_id or len(output_ids) >= self.config.max_new_tokens
-    
+
+    def _setup_attn_weight_collection(self, video_path: str):
+        """Create and attach an AttentionWeightCollector if config flag is set."""
+        if not self.config.save_attention_weights:
+            # Clear any stale collector from a previous run
+            for layer in self.model.language_model.layers:
+                if hasattr(layer.self_attn, 'attn_weight_collector'):
+                    del layer.self_attn.attn_weight_collector
+            if hasattr(self, '_attn_weight_collector'):
+                del self._attn_weight_collector
+            return None
+        video_slug = Path(video_path).stem
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join(OUTPUT_ROOT, f"{timestamp}_{video_slug}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        collector = AttentionWeightCollector(self.config, run_dir)
+
+        # Attach to every attention layer (used via duck-typing in forward())
+        for layer in self.model.language_model.layers:
+            layer.self_attn.attn_weight_collector = collector
+
+        self._attn_weight_collector = collector
+        return collector
 
     def prefill(self, hidden_states: torch.Tensor):
         for layer_idx in range(self.num_hidden_layers):
@@ -129,12 +156,19 @@ class VLMEngine:
     
 
     def decoding(self, token_id: int, cur_pos_idx: int):
+        collector = getattr(self, '_attn_weight_collector', None)
+        if collector is not None:
+            collector.start_step()
+
         hidden_states = self.model.text_embed(token_id)
         self.model.set_rotary_pos_emb(hidden_states, cur_pos_idx)
         for layer_idx in range(self.num_hidden_layers):
             hidden_states = self.model.attention(False, hidden_states, layer_idx)
             hidden_states = self.model.mlp(hidden_states, layer_idx)
         token_id, logits = self.model.output_head(hidden_states)
+
+        if collector is not None:
+            collector.finish_step()
         return token_id, logits
 
     def decoding_pipeline(self, token_id: int, cur_pos_idx: int):
@@ -150,6 +184,10 @@ class VLMEngine:
         prefetched with the previous layer's Q; _refill_pruned_sentinel()
         corrects the sentinel once the current layer's Q is available.
         """
+        collector = getattr(self, '_attn_weight_collector', None)
+        if collector is not None:
+            collector.start_step()
+
         hidden_states = self.model.text_embed(token_id)
         self.model.set_rotary_pos_emb(hidden_states, cur_pos_idx)
         mgr = self.kv_cache_manager
@@ -196,6 +234,9 @@ class VLMEngine:
                 current_slot = 1 - current_slot
 
         token_id, logits = self.model.output_head(hidden_states)
+
+        if collector is not None:
+            collector.finish_step()
         return token_id, logits
 
 
@@ -209,9 +250,13 @@ class VLMEngine:
         inputs = inputs.to(self.config.device)
         prompt_len = inputs["input_ids"].shape[1]
 
+        _tokens_per_frame = 0
         if isinstance(self.kv_cache_manager, SparseKVCacheManager):
             video_info = self.model.get_video_info(inputs)
             self.kv_cache_manager.set_video_info(video_info, prompt_len)
+            _tokens_per_frame = video_info.H_len * video_info.W_len
+
+        collector = self._setup_attn_weight_collection(video_path)
 
         # 2. encoding stage
         hidden_states = self.model.encoding(inputs)
@@ -220,6 +265,14 @@ class VLMEngine:
         token_id, logits = self.prefill(hidden_states)
         output_ids.append(token_id)
 
+        if collector is not None:
+            layer0 = self.kv_cache_manager.layers[0]
+            if hasattr(layer0, 'video_len'):
+                collector.set_sequence_info(layer0.video_len, layer0.text_seq_len,
+                                            _tokens_per_frame)
+            else:
+                collector.set_sequence_info(0, prompt_len)
+
         # 4. decoding stage
         while not self.is_finished(output_ids):
             cur_pos_idx = prompt_len + len(output_ids) - 1
@@ -227,6 +280,8 @@ class VLMEngine:
             output_ids.append(token_id)
 
         # 5. clean up kv cache
+        if collector is not None:
+            collector.save_metadata()
         self.kv_cache_manager.clear()
 
         # 6. decode output text
@@ -252,9 +307,13 @@ class VLMEngine:
         inputs = inputs.to(self.config.device)
         prompt_len = inputs["input_ids"].shape[1]
 
+        _tokens_per_frame = 0
         if isinstance(self.kv_cache_manager, SparseKVCacheManager):
             video_info = self.model.get_video_info(inputs)
             self.kv_cache_manager.set_video_info(video_info, prompt_len)
+            _tokens_per_frame = video_info.H_len * video_info.W_len
+
+        collector = self._setup_attn_weight_collection(video_path)
 
         # 2. encoding stage
         hidden_states = self.model.encoding(inputs)
@@ -263,6 +322,14 @@ class VLMEngine:
         token_id, logits = self.prefill(hidden_states)
         output_ids.append(token_id)
 
+        if collector is not None:
+            layer0 = self.kv_cache_manager.layers[0]
+            if hasattr(layer0, 'video_len'):
+                collector.set_sequence_info(layer0.video_len, layer0.text_seq_len,
+                                            _tokens_per_frame)
+            else:
+                collector.set_sequence_info(0, prompt_len)
+
         # 4. decoding stage (pipeline)
         while not self.is_finished(output_ids):
             cur_pos_idx = prompt_len + len(output_ids) - 1
@@ -270,6 +337,8 @@ class VLMEngine:
             output_ids.append(token_id)
 
         # 5. clean up kv cache
+        if collector is not None:
+            collector.save_metadata()
         self.kv_cache_manager.clear()
 
         # 6. decode output text
@@ -294,10 +363,14 @@ class VLMEngine:
         inputs = inputs.to(device)
         prompt_len = inputs["input_ids"].shape[1]
 
+        _tokens_per_frame = 0
         if isinstance(self.kv_cache_manager, SparseKVCacheManager):
             video_info = self.model.get_video_info(inputs)
             self.kv_cache_manager.set_video_info(video_info, prompt_len)
+            _tokens_per_frame = video_info.H_len * video_info.W_len
         t_process = perf_counter()
+
+        collector = self._setup_attn_weight_collection(video_path)
 
         # 2. encoding stage
         torch.cuda.synchronize()
@@ -320,6 +393,14 @@ class VLMEngine:
         peak_prefill = torch.cuda.max_memory_allocated(device) - mem_before_prefill
         peak_global = max(peak_global, torch.cuda.max_memory_allocated(device))
         t_prefill = perf_counter()
+
+        if collector is not None:
+            layer0 = self.kv_cache_manager.layers[0]
+            if hasattr(layer0, 'video_len'):
+                collector.set_sequence_info(layer0.video_len, layer0.text_seq_len,
+                                            _tokens_per_frame)
+            else:
+                collector.set_sequence_info(0, prompt_len)
 
         # snapshot KV cache stats after prefill (before decode modifies seq_len)
         kv_stats = self.kv_cache_manager.get_memory_stats()
@@ -384,6 +465,8 @@ class VLMEngine:
         print(f" Peak global:         {format_bytes(peak_global)}")
 
         # 6. clean up kv cache
+        if collector is not None:
+            collector.save_metadata()
         self.kv_cache_manager.clear()
 
         # 7. decode output text

@@ -141,6 +141,11 @@ class Qwen3VLTextAttention(nn.Module):
                 causal=True,
             )
 
+            if hasattr(self, 'attn_weight_collector') and self.attn_weight_collector is not None:
+                self.attn_weight_collector.add_layer(
+                    self.layer_idx, q, k_cache, cache_seqlens,
+                    self.num_attention_heads, self.num_key_value_heads)
+
             # Sync the newly written token's KV from GPU buffer back to CacheLayer
             # storage, and advance this layer's seq_len counter
             kv_cache_manager.offload_after_decode(self.layer_idx)
@@ -239,6 +244,11 @@ class Qwen3VLTextAttention(nn.Module):
             cache_seqlens=cache_seqlens,
             causal=True,
         )
+
+        if hasattr(self, 'attn_weight_collector') and self.attn_weight_collector is not None:
+            self.attn_weight_collector.add_layer(
+                self.layer_idx, q, k_cache, cache_seqlens,
+                self.num_attention_heads, self.num_key_value_heads)
 
         # Sync new token's KV back to CacheLayer storage
         if hasattr(kv_cache_manager, 'offload_after_decode_pipeline'):
