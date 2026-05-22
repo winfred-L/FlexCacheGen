@@ -365,6 +365,8 @@ class SparseCacheLayer(CacheLayer):
         self.video_paged_values: torch.Tensor | None = None
         self.page_min_keys: torch.Tensor | None = None      # [num_pages, num_heads, D] - Quest metadata
         self.page_max_keys: torch.Tensor | None = None      # [num_pages, num_heads, D] - Quest metadata
+        self.video_min_keys: torch.Tensor | None = None     # [num_heads, D] - global min K across ALL video tokens
+        self.video_max_keys: torch.Tensor | None = None     # [num_heads, D] - global max K across ALL video tokens
 
     def set_pruning_info(self, pruned_heads: list[int], num_total_heads: int):
         """
@@ -433,10 +435,16 @@ class SparseCacheLayer(CacheLayer):
             page_min[full_pages] = last_data.amin(dim=0)
             page_max[full_pages] = last_data.amax(dim=0)
 
+        # Compute global video min/max (across ALL pages) for video-level gating
+        self.video_min_keys = page_min.amin(dim=0)  # [num_heads, head_dim]
+        self.video_max_keys = page_max.amax(dim=0)  # [num_heads, head_dim]
+
         # Store on CPU pinned memory when offloading — avoids GPU→CPU sync during decode
         if store_on_cpu:
             page_min = page_min.cpu().pin_memory()
             page_max = page_max.cpu().pin_memory()
+            self.video_min_keys = self.video_min_keys.cpu().pin_memory()
+            self.video_max_keys = self.video_max_keys.cpu().pin_memory()
 
         self.page_min_keys = page_min
         self.page_max_keys = page_max
@@ -465,6 +473,27 @@ class SparseCacheLayer(CacheLayer):
         upper = torch.maximum(prod_min, prod_max)  # [P, H, D]
         # sum over head_dim (per-head Q·K upper bound), then aggregate over heads
         return upper.sum(dim=-1).sum(dim=-1)  # [P]
+
+    def quest_score_global(self, q_kv: torch.Tensor) -> torch.Tensor:
+        """
+        Global video importance score — upper bound of Q·K for ANY video token.
+
+        Uses the per-head per-dimension min/max of K across ALL video tokens
+        (not per-page). Returns a scalar: the maximum possible sum_i q[i]·k[i]
+        for any token in the entire video. Low score → no video token can have
+        high attention weight → video can be skipped entirely for this step.
+
+        Args:
+            q_kv: [num_heads, head_dim] — query mapped to KV groups, matching
+                  the head layout of video_min_keys / video_max_keys.
+        Returns:
+            scalar tensor (0-dim)
+        """
+        q = q_kv.unsqueeze(0)  # [1, H, D]
+        prod_min = q * self.video_min_keys  # [1, H, D]
+        prod_max = q * self.video_max_keys  # [1, H, D]
+        upper = torch.maximum(prod_min, prod_max)  # [1, H, D]
+        return upper.sum()  # scalar
 
     def initialize_from_prefill(
         self,
@@ -652,6 +681,7 @@ class SparseKVCacheManager(KVCacheManager):
         self.num_q_heads: int = self.config.hf_config.text_config.num_attention_heads
         self.num_kv_heads: int = self.config.hf_config.text_config.num_key_value_heads
         self.current_query: torch.Tensor | None = None
+        self._last_video_tokens_used: int = 0  # cached from _load_layer_quest for offload_after_decode
 
         # --- Pipeline: overlap attention with KV prefetch ---
         # Active iff config.pipeline is True (requires dynamic_sparse_threshold).
@@ -1028,10 +1058,43 @@ class SparseKVCacheManager(KVCacheManager):
             top_k = num_video_pages
             video_tokens_used = cache_layer.video_len
 
+        # === Global video gating: skip all video if no token could be important ===
+        # Uses the global min/max K (across ALL video tokens) to compute an upper
+        # bound on Q·K for any video token. If this bound is below the threshold,
+        # no video token can have meaningful attention weight → skip video entirely.
+        video_gating_threshold = self.config.video_gating_threshold
+        if (video_gating_threshold is not None
+                and video_tokens_used > 0
+                and num_video_pages > 0
+                and self.current_query is not None
+                and cache_layer.video_min_keys is not None):
+            q_kv_full = self._map_q_to_kv_heads(self.current_query)
+            if cache_layer.video_min_keys.is_cuda:
+                if cache_layer.is_pruned:
+                    kept_idx = cache_layer.kept_head_indices.to(q_kv_full.device)
+                    q_kv = q_kv_full.index_select(0, kept_idx)
+                else:
+                    q_kv = q_kv_full
+                q_kv = q_kv.to(dtype=cache_layer.video_min_keys.dtype)
+                global_score = cache_layer.quest_score_global(q_kv)
+            else:
+                q_kv_cpu = q_kv_full.to(device='cpu', dtype=cache_layer.video_min_keys.dtype)
+                if cache_layer.is_pruned:
+                    kept_idx = cache_layer.kept_head_indices
+                    q_kv_cpu = q_kv_cpu.index_select(0, kept_idx)
+                global_score = cache_layer.quest_score_global(q_kv_cpu)
+            if global_score < video_gating_threshold:
+                video_tokens_used = 0
+                selected_pages = None
+
+        self._last_video_tokens_used = video_tokens_used
+
         total_len = video_tokens_used + text_seq_len
 
         # === Build contiguous video region ===
-        if selected_pages is None:
+        if video_tokens_used == 0:
+            pass  # video gated out — only text KV will be loaded
+        elif selected_pages is None:
             # All pages kept — single contiguous DMA from pinned memory
             src_k = cache_layer.video_paged_keys
             src_v = cache_layer.video_paged_values
@@ -1125,21 +1188,9 @@ class SparseKVCacheManager(KVCacheManager):
         # --- Quest contiguous buffer path ---
         # buffer layout: [video_tokens_used | text tokens]
         # new token write position = video_tokens_used + text_seq_len (before incr)
-        # need to recompute top_k to determine video_tokens_used
-        threshold = self.config.dynamic_sparse_threshold
-        num_video_pages = cache_layer.num_video_pages
-        if (threshold is not None and num_video_pages > 0
-                and cache_layer.page_min_keys is not None):
-            top_k = max(1, min(num_video_pages,
-                        int(round(num_video_pages * threshold))))
-        else:
-            top_k = num_video_pages
-
-        if top_k >= num_video_pages:
-            # keep all, layout same as continuous mode
-            video_tokens_used = cache_layer.video_len
-        else:
-            video_tokens_used = top_k * self.page_size  # Quest compression
+        # Uses _last_video_tokens_used cached from the most recent _load_layer_quest
+        # call, which accounts for both Quest page selection and global video gating.
+        video_tokens_used = self._last_video_tokens_used
 
         text_seq_len_before_inc = cache_layer.text_seq_len  # before incr
         buf_pos = video_tokens_used + text_seq_len_before_inc

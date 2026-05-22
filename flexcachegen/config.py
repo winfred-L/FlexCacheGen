@@ -81,8 +81,14 @@ class Config:
         # "negative": fill pruned head K vectors with -M * sign(Q), so that
         #             Q·K is a large negative value → softmax ≈ 0 (true pruning)
 
-    dynamic_sparse_threshold: float | None = None
+    dynamic_sparse_threshold: float | None = 0.1
     page_size: int = 256  # FA2 paged attention block size (must be multiple of 256)
+    video_gating_threshold: float | None = 0.5
+        # If not None, compute a global video importance score using the min/max
+        # K of ALL video tokens before Quest page selection. If the score is
+        # below this threshold, skip loading video KV entirely for this decode
+        # step (video_tokens_used = 0). Saves DMA bandwidth when no video token
+        # could contribute meaningful attention. Requires dynamic_sparse_threshold.
 
     # Pipeline: overlap attention computation with KV prefetch (decode only)
     pipeline: bool = False
@@ -112,6 +118,8 @@ class Config:
             self.pruning_k_type = kwargs.pop('pruning_k_type')
         if 'pipeline' in kwargs:
             self.pipeline = kwargs.pop('pipeline')
+        if 'video_gating_threshold' in kwargs:
+            self.video_gating_threshold = kwargs.pop('video_gating_threshold')
         if 'save_attention_weights' in kwargs:
             self.save_attention_weights = kwargs.pop('save_attention_weights')
 
@@ -119,6 +127,8 @@ class Config:
             raise ValueError('Dynamic sparse threshold is required for pipeline')
         if self.pipeline and self.offload_kv_to_cpu is False:
             raise ValueError('Offloading KV to CPU is required for pipeline')
+        if self.video_gating_threshold and self.dynamic_sparse_threshold is None:
+            raise ValueError('Dynamic sparse threshold is required for video gating')
 
         if self.static_sparse_threshold is not None:
             if self.static_sparse_threshold not in pruning_heads_list:
@@ -143,6 +153,8 @@ class Config:
             print(f"    Pruning K type: {self.pruning_k_type}")
         if self.dynamic_sparse_threshold is not None:
             print(f"  Dynamic sparse threshold: {self.dynamic_sparse_threshold}")
+        if self.video_gating_threshold is not None:
+            print(f"  Video gating threshold:   {self.video_gating_threshold}")
         print(f"Pipeline:           ", self.pipeline)
         print("Save attn weights:  ", self.save_attention_weights)
         print("="*50)
