@@ -11,6 +11,7 @@ from flexcachegen.attention_weights import AttentionWeightCollector
 from flexcachegen.config import OUTPUT_ROOT, Config
 from flexcachegen.kvcache import KVCacheManager, SparseKVCacheManager
 from flexcachegen.models.qwen3vl import Qwen3VLModel
+from flexcachegen.sparse_metrics import SparseMetricsCollector
 from flexcachegen.utils import format_bytes
 
 
@@ -122,7 +123,7 @@ class VLMEngine:
     def is_finished(self, output_ids: list[int]) -> bool:
         return output_ids[-1] in self.config.eos_token_id or len(output_ids) >= self.config.max_new_tokens
 
-    def _setup_attn_weight_collection(self, video_path: str):
+    def _setup_attn_weight_collection(self, video_path: str, run_dir: str = ""):
         """Create and attach an AttentionWeightCollector if config flag is set."""
         if not self.config.save_attention_weights:
             # Clear any stale collector from a previous run
@@ -132,10 +133,11 @@ class VLMEngine:
             if hasattr(self, '_attn_weight_collector'):
                 del self._attn_weight_collector
             return None
-        video_slug = Path(video_path).stem
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = os.path.join(OUTPUT_ROOT, f"{timestamp}_{video_slug}")
-        os.makedirs(run_dir, exist_ok=True)
+        if not run_dir:
+            video_slug = Path(video_path).stem
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_dir = os.path.join(OUTPUT_ROOT, f"{timestamp}_{video_slug}")
+            os.makedirs(run_dir, exist_ok=True)
 
         collector = AttentionWeightCollector(self.config, run_dir)
 
@@ -145,6 +147,31 @@ class VLMEngine:
 
         self._attn_weight_collector = collector
         return collector
+
+    def _setup_sparse_metrics_collection(self, video_path: str, run_dir: str | None = None):
+        """Create and attach a SparseMetricsCollector if config flag is set."""
+        if not self.config.save_sparse_metrics:
+            if hasattr(self.kv_cache_manager, 'collector'):
+                self.kv_cache_manager.collector = None
+            return None
+
+        if run_dir is None:
+            video_slug = Path(video_path).stem
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_dir = os.path.join(OUTPUT_ROOT, f"{timestamp}_{video_slug}")
+            os.makedirs(run_dir, exist_ok=True)
+
+        collector = SparseMetricsCollector(self.config, run_dir)
+        self.kv_cache_manager.collector = collector
+        return collector
+
+    def _get_or_create_run_dir(self, video_path: str) -> str:
+        """Return shared run_dir when both collectors are active."""
+        video_slug = Path(video_path).stem
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join(OUTPUT_ROOT, f"{timestamp}_{video_slug}")
+        os.makedirs(run_dir, exist_ok=True)
+        return run_dir
 
     def prefill(self, hidden_states: torch.Tensor):
         for layer_idx in range(self.num_hidden_layers):
@@ -256,7 +283,14 @@ class VLMEngine:
             self.kv_cache_manager.set_video_info(video_info, prompt_len)
             _tokens_per_frame = video_info.H_len * video_info.W_len
 
-        collector = self._setup_attn_weight_collection(video_path)
+        # Set up shared run_dir if either collector is active
+        if self.config.save_attention_weights or self.config.save_sparse_metrics:
+            run_dir = self._get_or_create_run_dir(video_path)
+        else:
+            run_dir = ""
+
+        collector = self._setup_attn_weight_collection(video_path, run_dir)
+        sparse_collector = self._setup_sparse_metrics_collection(video_path, run_dir)
 
         # 2. encoding stage
         hidden_states = self.model.encoding(inputs)
@@ -273,15 +307,27 @@ class VLMEngine:
             else:
                 collector.set_sequence_info(0, prompt_len)
 
+        if sparse_collector is not None:
+            layer0 = self.kv_cache_manager.layers[0]
+            video_len = getattr(layer0, 'video_len', 0)
+            num_pages = getattr(layer0, 'num_video_pages', 0)
+            sparse_collector.set_video_info(video_len, num_pages)
+
         # 4. decoding stage
         while not self.is_finished(output_ids):
             cur_pos_idx = prompt_len + len(output_ids) - 1
+            if sparse_collector is not None:
+                sparse_collector.start_step()
             token_id, logits = self.decoding(token_id, cur_pos_idx)
+            if sparse_collector is not None:
+                sparse_collector.finish_step()
             output_ids.append(token_id)
 
         # 5. clean up kv cache
         if collector is not None:
             collector.save_metadata()
+        if sparse_collector is not None:
+            sparse_collector.save_metadata()
         self.kv_cache_manager.clear()
 
         # 6. decode output text
@@ -313,7 +359,14 @@ class VLMEngine:
             self.kv_cache_manager.set_video_info(video_info, prompt_len)
             _tokens_per_frame = video_info.H_len * video_info.W_len
 
-        collector = self._setup_attn_weight_collection(video_path)
+        # Set up shared run_dir if either collector is active
+        if self.config.save_attention_weights or self.config.save_sparse_metrics:
+            run_dir = self._get_or_create_run_dir(video_path)
+        else:
+            run_dir = ""
+
+        collector = self._setup_attn_weight_collection(video_path, run_dir)
+        sparse_collector = self._setup_sparse_metrics_collection(video_path, run_dir)
 
         # 2. encoding stage
         hidden_states = self.model.encoding(inputs)
@@ -330,15 +383,27 @@ class VLMEngine:
             else:
                 collector.set_sequence_info(0, prompt_len)
 
+        if sparse_collector is not None:
+            layer0 = self.kv_cache_manager.layers[0]
+            video_len = getattr(layer0, 'video_len', 0)
+            num_pages = getattr(layer0, 'num_video_pages', 0)
+            sparse_collector.set_video_info(video_len, num_pages)
+
         # 4. decoding stage (pipeline)
         while not self.is_finished(output_ids):
             cur_pos_idx = prompt_len + len(output_ids) - 1
+            if sparse_collector is not None:
+                sparse_collector.start_step()
             token_id, logits = self.decoding_pipeline(token_id, cur_pos_idx)
+            if sparse_collector is not None:
+                sparse_collector.finish_step()
             output_ids.append(token_id)
 
         # 5. clean up kv cache
         if collector is not None:
             collector.save_metadata()
+        if sparse_collector is not None:
+            sparse_collector.save_metadata()
         self.kv_cache_manager.clear()
 
         # 6. decode output text

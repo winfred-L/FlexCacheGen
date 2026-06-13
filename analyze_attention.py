@@ -166,6 +166,10 @@ def main():
         "--skip-plot", action="store_true",
         help="Only run inference, don't generate plots",
     )
+    parser.add_argument(
+        "--save-sparse-metrics", action="store_true",
+        help="Collect sparse-pruning metrics (Quest page selection, gating) during decode",
+    )
 
     # -- Plot ---------------------------------------------------------------
     parser.add_argument("--layer", type=int, default=None, help="Layer index to plot")
@@ -199,6 +203,7 @@ def main():
         vlm = VLMEngine(
             model_type="qwen3vl-8b",
             save_attention_weights=True,
+            save_sparse_metrics=args.save_sparse_metrics,
             max_new_tokens=args.max_new_tokens,
         )
 

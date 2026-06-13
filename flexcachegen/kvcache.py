@@ -357,7 +357,8 @@ class SparseCacheLayer(CacheLayer):
         # --- Quest / dynamic sparsity metadata ---
         # Active when config.dynamic_sparse_threshold is not None.
         # Video KV is stored in paged format [num_pages, page_size, H, D] as source;
-        # _load_layer_quest gathers selected pages into a contiguous GPU buffer.
+        # _load_layer_quest: global gating + per-page selection via text-QK
+        # percentiles, gathers selected pages into a contiguous GPU buffer.
         self.paged: bool = paged
         self.page_size: int = page_size
         self.num_video_pages: int = 0
@@ -481,7 +482,7 @@ class SparseCacheLayer(CacheLayer):
         Uses the per-head per-dimension min/max of K across ALL video tokens
         (not per-page). Returns a scalar: the maximum possible sum_i q[i]·k[i]
         for any token in the entire video. Low score → no video token can have
-        high attention weight → video can be skipped entirely for this step.
+        high attention weight.
 
         Args:
             q_kv: [num_heads, head_dim] — query mapped to KV groups, matching
@@ -660,6 +661,10 @@ class SparseKVCacheManager(KVCacheManager):
         # Continuous GPU buffer (shared by both paged and non-paged modes)
         self._gpu_keys: torch.Tensor | None = None
         self._gpu_values: torch.Tensor | None = None
+
+        # Sparse metrics collector — attached by engine when save_sparse_metrics=True
+        self.collector: object | None = None
+        self._current_load_layer_idx: int = 0
 
         # Video metadata — set by set_video_info() before prefill
         self.video_info: VideoInfo | None = None
@@ -914,6 +919,7 @@ class SparseKVCacheManager(KVCacheManager):
         if not self.paged:
             return self._load_layer_continuous(cache_layer, video_len, text_seq_len)
         else:
+            self._current_load_layer_idx = layer_idx
             keys, values, total_len, _ = self._load_layer_quest(cache_layer, video_len, text_seq_len)
             return keys, values, total_len
 
@@ -981,21 +987,23 @@ class SparseKVCacheManager(KVCacheManager):
         sync: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
         """
-        Quest + contiguous buffer path.
+        Text-QK-based dynamic video page selection + contiguous buffer path.
 
-        When page_min_keys is on CPU (offload mode), Quest scoring runs entirely
-        on CPU — avoiding the GPU→CPU sync that GPU-side scoring would require
-        to transfer selected page indices back. The Q vector is tiny (a few KB)
-        so moving it to CPU is negligible.
+        For each decode step:
+        1. Compute exact Q·K for all text tokens, sort descending.
+        2. (Global gating) If video_gating_threshold is set, compute the gate
+           cutoff at that percentile from text scores. If the global video upper
+           bound (quest_score_global) is below this cutoff, skip all video.
+        3. (Page selection) Compute the page cutoff at dynamic_sparse_threshold
+           percentile. Keep pages whose Quest upper bound exceeds the cutoff.
+        Both thresholds are data-dependent percentiles of text Q·K scores.
 
         Video KV pages are gathered into a CPU pinned staging buffer before DMA
         to ensure truly asynchronous CPU→GPU transfer (non-pinned source would
         force synchronous memcpy).
 
         GPU buffer layout:
-        - Quest selected (top_k < num_video_pages): [top_k*page_size video tokens | text_seq_len tokens]
-        - All kept (top_k >= num_video_pages): [video_len video tokens | text_seq_len tokens]
-        - cache_seqlens = video_tokens_used + text_seq_len
+        [video_tokens_used video tokens | text_seq_len tokens]
 
         Args:
             target_keys:   GPU buffer to write into (defaults to self._gpu_keys)
@@ -1015,79 +1023,177 @@ class SparseKVCacheManager(KVCacheManager):
         page_size = self.page_size
         threshold = self.config.dynamic_sparse_threshold
 
-        # === Quest: select Top-K video pages ===
+        # === Text-QK-based dynamic page selection ===
+        # Compute Q·K for all text tokens, sort descending. Use the sorted scores
+        # to derive two data-dependent cutoffs:
+        #   - video_gating_threshold → global gate: skip all video if the global
+        #     upper bound (across ALL video tokens) falls below this percentile.
+        #   - dynamic_sparse_threshold → page cutoff: keep only pages whose
+        #     per-page upper bound exceeds this percentile.
         use_quest = (
             num_video_pages > 0
             and threshold is not None
             and self.current_query is not None
             and cache_layer.page_min_keys is not None
         )
-        if use_quest:
-            top_k = max(1, min(num_video_pages,
-                        int(round(num_video_pages * threshold))))
-            if top_k < num_video_pages:
-                if cache_layer.page_min_keys.is_cuda:
-                    # GPU-side Quest scoring (when metadata is on GPU)
-                    q_kv_full = self._map_q_to_kv_heads(self.current_query)
-                    if cache_layer.is_pruned:
-                        kept_idx = cache_layer.kept_head_indices.to(q_kv_full.device)
-                        q_kv = q_kv_full.index_select(0, kept_idx)
-                    else:
-                        q_kv = q_kv_full
-                    q_kv = q_kv.to(dtype=cache_layer.page_min_keys.dtype)
-                    scores = cache_layer.quest_score_pages(q_kv)
-                    selected_pages = torch.topk(scores, top_k).indices
-                    selected_pages, _ = torch.sort(selected_pages)
-                    selected_pages = selected_pages.to(device='cpu')
-                else:
-                    # CPU-side Quest scoring (when metadata is on CPU — avoids GPU→CPU sync)
-                    q_kv_full = self._map_q_to_kv_heads(self.current_query)
-                    q_kv_cpu = q_kv_full.to(device='cpu', dtype=cache_layer.page_min_keys.dtype)
-                    if cache_layer.is_pruned:
-                        kept_idx = cache_layer.kept_head_indices
-                        q_kv_cpu = q_kv_cpu.index_select(0, kept_idx)
-                    scores = cache_layer.quest_score_pages(q_kv_cpu)
-                    selected_pages, _ = torch.sort(torch.topk(scores, top_k).indices)
-                video_tokens_used = top_k * page_size
-            else:
-                selected_pages = None
-                top_k = num_video_pages
-                video_tokens_used = cache_layer.video_len
-        else:
-            selected_pages = None
-            top_k = num_video_pages
-            video_tokens_used = cache_layer.video_len
-
-        # === Global video gating: skip all video if no token could be important ===
-        # Uses the global min/max K (across ALL video tokens) to compute an upper
-        # bound on Q·K for any video token. If this bound is below the threshold,
-        # no video token can have meaningful attention weight → skip video entirely.
         video_gating_threshold = self.config.video_gating_threshold
-        if (video_gating_threshold is not None
-                and video_tokens_used > 0
-                and num_video_pages > 0
-                and self.current_query is not None
-                and cache_layer.video_min_keys is not None):
-            q_kv_full = self._map_q_to_kv_heads(self.current_query)
-            if cache_layer.video_min_keys.is_cuda:
+
+        # Metrics placeholders — populated in the branches below, read by the
+        # collector block after _last_video_tokens_used assignment.
+        _metrics_text_scores: torch.Tensor | None = None
+        _metrics_page_scores: torch.Tensor | None = None
+        _metrics_page_cutoff: float | None = None
+        _metrics_gate_cutoff: float | None = None
+        _metrics_global_score: float | None = None
+        _metrics_selected_mask: torch.Tensor | None = None
+        _metrics_gated: bool = False
+
+        if use_quest and text_seq_len > 0:
+            if cache_layer.page_min_keys.is_cuda:
+                # --- GPU-side: metadata and text keys are on GPU ---
+                q_kv_full = self._map_q_to_kv_heads(self.current_query)
                 if cache_layer.is_pruned:
                     kept_idx = cache_layer.kept_head_indices.to(q_kv_full.device)
                     q_kv = q_kv_full.index_select(0, kept_idx)
                 else:
                     q_kv = q_kv_full
-                q_kv = q_kv.to(dtype=cache_layer.video_min_keys.dtype)
-                global_score = cache_layer.quest_score_global(q_kv)
+                q_kv = q_kv.to(dtype=cache_layer.page_min_keys.dtype)
+
+                # Q·K for all text tokens: Σ_h Σ_d q[h,d] · text_k[t,h,d]
+                text_k = cache_layer.text_keys[0, :text_seq_len]  # [T, H_all, D]
+                if cache_layer.is_pruned:
+                    text_k = text_k.index_select(1, kept_idx)      # [T, H_k, D]
+                text_k = text_k.to(dtype=q_kv.dtype)
+                text_scores = torch.einsum('hd,thd->t', q_kv, text_k)  # [T]
+                text_scores_sorted = text_scores.sort(descending=True)[0]
+
+                # --- Global video gating ---
+                gated = False
+                if (video_gating_threshold is not None
+                        and cache_layer.video_min_keys is not None):
+                    gate_cutoff_idx = min(int(text_seq_len * video_gating_threshold),
+                                          text_seq_len - 1)
+                    gate_cutoff = text_scores_sorted[gate_cutoff_idx]
+                    global_score = cache_layer.quest_score_global(q_kv)
+                    _metrics_gate_cutoff = gate_cutoff.item()
+                    _metrics_global_score = global_score.item()
+                    if global_score < gate_cutoff:
+                        selected_pages = None
+                        video_tokens_used = 0
+                        gated = True
+                        _metrics_selected_mask = torch.zeros(num_video_pages, dtype=torch.bool)
+
+                if not gated:
+                    # --- Per-page selection ---
+                    page_cutoff_idx = min(int(text_seq_len * threshold),
+                                          text_seq_len - 1)
+                    page_cutoff = text_scores_sorted[page_cutoff_idx]
+
+                    page_scores = cache_layer.quest_score_pages(q_kv)  # [P]
+                    selected_mask = page_scores > page_cutoff
+                    selected_count = int(selected_mask.sum().item())
+
+                    _metrics_page_cutoff = page_cutoff.item()
+                    _metrics_page_scores = page_scores
+                    _metrics_selected_mask = selected_mask
+
+                    if selected_count == 0:
+                        selected_pages = None
+                        video_tokens_used = 0
+                    elif selected_count >= num_video_pages:
+                        selected_pages = None
+                        video_tokens_used = cache_layer.video_len
+                    else:
+                        selected_indices = selected_mask.nonzero(as_tuple=True)[0]
+                        selected_pages = selected_indices.to(device='cpu')
+                        video_tokens_used = selected_count * page_size
+
+                _metrics_text_scores = text_scores_sorted
+                _metrics_gated = gated
             else:
-                q_kv_cpu = q_kv_full.to(device='cpu', dtype=cache_layer.video_min_keys.dtype)
+                # --- CPU-side: metadata and text keys are on CPU pinned memory ---
+                q_kv_full = self._map_q_to_kv_heads(self.current_query)
+                q_kv_cpu = q_kv_full.to(device='cpu', dtype=cache_layer.page_min_keys.dtype)
                 if cache_layer.is_pruned:
                     kept_idx = cache_layer.kept_head_indices
                     q_kv_cpu = q_kv_cpu.index_select(0, kept_idx)
-                global_score = cache_layer.quest_score_global(q_kv_cpu)
-            if global_score < video_gating_threshold:
-                video_tokens_used = 0
-                selected_pages = None
+
+                text_k = cache_layer.text_keys[0, :text_seq_len]  # [T, H_all, D]
+                if cache_layer.is_pruned:
+                    text_k = text_k.index_select(1, kept_idx)      # [T, H_k, D]
+                text_k = text_k.to(device='cpu', dtype=q_kv_cpu.dtype)
+                text_scores = torch.einsum('hd,thd->t', q_kv_cpu, text_k)  # [T]
+                text_scores_sorted = text_scores.sort(descending=True)[0]
+
+                # --- Global video gating ---
+                gated = False
+                if (video_gating_threshold is not None
+                        and cache_layer.video_min_keys is not None):
+                    gate_cutoff_idx = min(int(text_seq_len * video_gating_threshold),
+                                          text_seq_len - 1)
+                    gate_cutoff = text_scores_sorted[gate_cutoff_idx]
+                    global_score = cache_layer.quest_score_global(q_kv_cpu)
+                    _metrics_gate_cutoff = gate_cutoff.item()
+                    _metrics_global_score = global_score.item()
+                    if global_score < gate_cutoff:
+                        selected_pages = None
+                        video_tokens_used = 0
+                        gated = True
+                        _metrics_selected_mask = torch.zeros(num_video_pages, dtype=torch.bool)
+
+                if not gated:
+                    # --- Per-page selection ---
+                    page_cutoff_idx = min(int(text_seq_len * threshold),
+                                          text_seq_len - 1)
+                    page_cutoff = text_scores_sorted[page_cutoff_idx]
+
+                    page_scores = cache_layer.quest_score_pages(q_kv_cpu)  # [P]
+                    selected_mask = page_scores > page_cutoff
+                    selected_count = int(selected_mask.sum().item())
+
+                    _metrics_page_cutoff = page_cutoff.item()
+                    _metrics_page_scores = page_scores
+                    _metrics_selected_mask = selected_mask
+
+                    if selected_count == 0:
+                        selected_pages = None
+                        video_tokens_used = 0
+                    elif selected_count >= num_video_pages:
+                        selected_pages = None
+                        video_tokens_used = cache_layer.video_len
+                    else:
+                        selected_indices = selected_mask.nonzero(as_tuple=True)[0]
+                        selected_pages = selected_indices.to(device='cpu')
+                        video_tokens_used = selected_count * page_size
+
+                _metrics_text_scores = text_scores_sorted
+                _metrics_gated = gated
+        else:
+            selected_pages = None
+            video_tokens_used = cache_layer.video_len
 
         self._last_video_tokens_used = video_tokens_used
+
+        # --- Record sparse metrics if collector is attached ---
+        if self.collector is not None and _metrics_text_scores is not None:
+            self.collector.add_layer(
+                self._current_load_layer_idx,  # set by caller before load_layer_to_gpu
+                {
+                    "text_scores_sorted": _metrics_text_scores,
+                    "page_scores": _metrics_page_scores,
+                    "page_cutoff": _metrics_page_cutoff,
+                    "gate_cutoff": _metrics_gate_cutoff,
+                    "global_score": _metrics_global_score,
+                    "selected_mask": (
+                        _metrics_selected_mask
+                        if _metrics_selected_mask is not None
+                        else torch.ones(num_video_pages, dtype=torch.bool)
+                    ),
+                    "video_tokens_used": video_tokens_used,
+                    "video_len": cache_layer.video_len,
+                    "gated": _metrics_gated,
+                },
+            )
 
         total_len = video_tokens_used + text_seq_len
 
@@ -1189,7 +1295,7 @@ class SparseKVCacheManager(KVCacheManager):
         # buffer layout: [video_tokens_used | text tokens]
         # new token write position = video_tokens_used + text_seq_len (before incr)
         # Uses _last_video_tokens_used cached from the most recent _load_layer_quest
-        # call, which accounts for both Quest page selection and global video gating.
+        # call, which accounts for global gating and text-QK-based page selection.
         video_tokens_used = self._last_video_tokens_used
 
         text_seq_len_before_inc = cache_layer.text_seq_len  # before incr
@@ -1297,6 +1403,7 @@ class SparseKVCacheManager(KVCacheManager):
         if q is not None:
             self.set_current_query(q)
 
+        self._current_load_layer_idx = layer_idx
         _, _, total_len, video_tokens_used = self._load_layer_quest(
             cache_layer, video_len, text_seq_len,
             target_keys=target_keys, target_values=target_values,
@@ -1347,6 +1454,7 @@ class SparseKVCacheManager(KVCacheManager):
             # without blocking the CPU (unlike event.synchronize())
             self._prefetch_stream.wait_event(self._q_ready_event)
 
+            self._current_load_layer_idx = next_layer_idx
             _, _, total_len, video_tokens_used = self._load_layer_quest(
                 cache_layer, video_len, text_seq_len,
                 target_keys=target_keys, target_values=target_values,

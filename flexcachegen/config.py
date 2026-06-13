@@ -81,14 +81,20 @@ class Config:
         # "negative": fill pruned head K vectors with -M * sign(Q), so that
         #             Q·K is a large negative value → softmax ≈ 0 (true pruning)
 
-    dynamic_sparse_threshold: float | None = 0.1
-    page_size: int = 256  # FA2 paged attention block size (must be multiple of 256)
-    video_gating_threshold: float | None = 0.5
-        # If not None, compute a global video importance score using the min/max
-        # K of ALL video tokens before Quest page selection. If the score is
-        # below this threshold, skip loading video KV entirely for this decode
-        # step (video_tokens_used = 0). Saves DMA bandwidth when no video token
-        # could contribute meaningful attention. Requires dynamic_sparse_threshold.
+    dynamic_sparse_threshold: float | None = 1.0
+        # Percentile threshold for text-QK-based video page selection.
+        # For each decode step: compute Q·K for all text tokens, sort descending,
+        # and use the value at this percentile as the cutoff. Video pages whose
+        # Quest upper-bound score exceeds this cutoff are kept; others are pruned.
+        # Lower = more aggressive (e.g. 0.1 = cutoff at top-10% text score).
+    video_gating_threshold: float | None = 0.01
+        # Percentile threshold for global video gating. Uses the same text-QK
+        # percentile logic but applied to the global video upper bound (min/max
+        # K across ALL video tokens). If the global upper bound is below this
+        # percentile of text Q·K scores, skip video entirely for this decode step.
+        # Lower = gate only when video is clearly irrelevant. Requires
+        # dynamic_sparse_threshold.
+    page_size: int = 256
 
     # Pipeline: overlap attention computation with KV prefetch (decode only)
     pipeline: bool = False
@@ -99,6 +105,10 @@ class Config:
     save_attention_weights: bool = False
         # True:  save softmax(QK^T) attention weights for every decode step,
         #        layer, and head to OUTPUT_ROOT for visualization/analysis
+
+    save_sparse_metrics: bool = False
+        # True:  collect text-QK scores, page scores, cutoffs, gating decisions
+        #        per decode step per layer for offline sparse-pruning visualization
 
     def __init__(self, model_type: str = 'qwen3vl-8b', **kwargs):
         if model_type not in MODEL_REGISTRY:
@@ -122,6 +132,8 @@ class Config:
             self.video_gating_threshold = kwargs.pop('video_gating_threshold')
         if 'save_attention_weights' in kwargs:
             self.save_attention_weights = kwargs.pop('save_attention_weights')
+        if 'save_sparse_metrics' in kwargs:
+            self.save_sparse_metrics = kwargs.pop('save_sparse_metrics')
 
         if self.pipeline and self.dynamic_sparse_threshold is None:
             raise ValueError('Dynamic sparse threshold is required for pipeline')
@@ -157,4 +169,5 @@ class Config:
             print(f"  Video gating threshold:   {self.video_gating_threshold}")
         print(f"Pipeline:           ", self.pipeline)
         print("Save attn weights:  ", self.save_attention_weights)
+        print("Save sparse metrics:", self.save_sparse_metrics)
         print("="*50)
