@@ -1,12 +1,14 @@
 from flexcachegen.engine import VLMEngine
 
 def main():
-    model_path = '/data/lyc/models/Qwen3-VL-8B-Instruct'
+    model_path = '/data/lyc/models/Qwen2.5-VL-7B-Instruct'
+    # model_path = '/data/lyc/models/Qwen3-VL-8B-Instruct'
     vlm = VLMEngine(model_path)
     
     samples = [
-        # ("./test/video/28s.mp4", 'Please describe this video in detail.'),
-        ("/data1/lyc/datasets/MLVU/MLVU/video/9_summary/217.mp4", 'Please describe this video in detail.'),
+        ("./test/video/28s.mp4", 'Please describe this video in detail.'),
+        # ("./test/video/1_first10s.mp4", 'Please describe this video in detail.'),
+        # ("/data1/lyc/datasets/MLVU/MLVU/video/9_summary/217.mp4", 'Please describe this video in detail.'),
     ]
     outputs = []
     

@@ -17,9 +17,9 @@ processor = AutoProcessor.from_pretrained("/data/lyc/models/Qwen3-VL-8B-Instruct
 
 
 video_fps = 1.0
-video_path = "/data/lyc/datasets/Video-MME/video/ZHWZf1Z4B5k.mp4" #28s
+# video_path = "/data/lyc/datasets/Video-MME/video/ZHWZf1Z4B5k.mp4" #28s
 # video_path = "/data/lyc/datasets/Video-MME/video/zNxi2s36tS0.mp4" #43s
-# video_path = "/data/lyc/datasets/Video-MME/video/Z-rHofd6g2Q.mp4" #66s
+video_path = "/data1/lyc/datasets/MLVU/MLVU/video/9_summary/217.mp4.mp4" #66s
 question = 'Please describe this video in detail.'
 messages = [
     {
@@ -27,12 +27,15 @@ messages = [
         "content": [
             {
                 "type": "video",
-                "video": video_path,
+                "video": "/data1/lyc/datasets/MLVU/MLVU/video/9_summary/217.mp4",
+                "fps": 1.0,
                 "max_pixels": 360 * 420,
-                "fps": video_fps,
             },
-            {"type": "text", "text": question},
-        ],
+            {
+                "type": "text",
+                "text": "Please describe this video in detail."
+            }
+        ]
     }
 ]
 

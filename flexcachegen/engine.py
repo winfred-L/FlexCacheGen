@@ -3,10 +3,15 @@ from time import perf_counter
 from tqdm.auto import tqdm
 
 from transformers import AutoProcessor
+try:
+    from qwen_vl_utils import process_vision_info
+except ImportError:
+    print("qwen is not installed. Please install qwen-vl-utils to use this model.")
 
 from flexcachegen.config import Config
 from flexcachegen.kvcache import KVCacheManager
 from flexcachegen.models.qwen3vl import Qwen3VLModel
+from flexcachegen.models.qwen25vl import Qwen25VLModel
 from flexcachegen.utils import get_tensor_size, print_cuda_memory_usage, print_duration
 
 
@@ -17,6 +22,13 @@ class VLMEngine:
     '''
 
     def __init__(self, model_path, **kwargs):
+        # model type
+        if "qwen2.5" in model_path.lower():
+            self.model_type = "qwen2.5"
+        elif "qwen3" in model_path.lower():
+            self.model_type = "qwen3"
+        else:
+            self.model_type = "unknown"
         # config
         # config_fields = {field.name for field in fields(Config)}
         # config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
@@ -25,7 +37,10 @@ class VLMEngine:
         # kv cache manager
         self.kv_cache_manager = KVCacheManager(self.config)
         # model
-        self.model = Qwen3VLModel(self.config, self.kv_cache_manager).to(self.config.device)
+        if self.model_type == "qwen2.5":
+            self.model = Qwen25VLModel(self.config, self.kv_cache_manager).to(self.config.device)
+        elif self.model_type == "qwen3":
+            self.model = Qwen3VLModel(self.config, self.kv_cache_manager).to(self.config.device)
         self.processor = AutoProcessor.from_pretrained(self.config.model_path, use_fast=True)
         self.num_hidden_layers = self.config.hf_config.text_config.num_hidden_layers
 
@@ -52,13 +67,28 @@ class VLMEngine:
                 ],
             }
         ]
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt"
-        )
+        if self.model_type == "qwen2.5":
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+            
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+                **video_kwargs,
+            )
+        elif self.model_type == "qwen3":
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+            )        
         return inputs
 
     
@@ -71,7 +101,8 @@ class VLMEngine:
         for layer_idx in range(self.num_hidden_layers):
             hidden_states = self.model.attention(True, hidden_states, layer_idx)
             hidden_states = self.model.mlp(hidden_states, layer_idx)
-            hidden_states = self.model.merge_visual_features(hidden_states, layer_idx)
+            if self.model_type == "qwen3":
+                hidden_states = self.model.merge_visual_features(hidden_states, layer_idx)
         token_id, logits = self.model.output_head(hidden_states)
         return token_id, logits
     
